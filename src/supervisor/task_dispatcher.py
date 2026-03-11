@@ -10,7 +10,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace as dc_replace
 from pathlib import Path
 from typing import Callable, Optional
 from uuid import uuid4
@@ -209,7 +209,7 @@ def _save_tasks() -> None:
         logger.error("Failed to save tasks: %s", e)
 
 
-_SAFE_ID_RE = _re.compile(r'^[0-9a-f\-]{8,36}$', _re.IGNORECASE)
+_SAFE_ID_RE = _re.compile(r'^[0-9a-zA-Z\-]{1,64}$')
 
 
 def _checkpoint_path(task_id: str) -> Path:
@@ -312,23 +312,29 @@ def _load_tasks() -> None:
                 pass
             elif task.status == "running":
                 # Was executing — mark as interrupted, merge checkpoint data
+                merge_kwargs: dict = {
+                    "status": "interrupted",
+                    "error": "Supervisor restarted while task was in progress",
+                    "finished_at": time.time(),
+                }
+
                 checkpoint = _load_checkpoint(tid)
                 if checkpoint:
-                    # Merge checkpoint: prefer checkpoint data (more recent)
+                    # Prefer checkpoint data when it's more complete
                     ckpt_steps = checkpoint.get("steps_completed", [])
                     if len(ckpt_steps) > len(task.steps_completed):
-                        task.steps_completed = ckpt_steps
-                    task.current_step = checkpoint.get("current_step", task.current_step)
+                        merge_kwargs["steps_completed"] = ckpt_steps
+                    ckpt_step = checkpoint.get("current_step", "")
+                    if ckpt_step:
+                        merge_kwargs["current_step"] = ckpt_step
                     partial = checkpoint.get("partial_result", "")
                     if partial and not task.result:
-                        task.result = partial
+                        merge_kwargs["result"] = partial
                     ckpt_sid = checkpoint.get("session_id", "")
                     if ckpt_sid and not task.session_id:
-                        task.session_id = ckpt_sid
+                        merge_kwargs["session_id"] = ckpt_sid
 
-                task.status = "interrupted"
-                task.error = "Supervisor restarted while task was in progress"
-                task.finished_at = time.time()
+                task = dc_replace(task, **merge_kwargs)
                 interrupted_count += 1
                 logger.warning(
                     "Task %s: running → interrupted (session=%s, steps=%d)",
@@ -623,6 +629,7 @@ async def dispatch(
     chat_id: Optional[str] = None,
     on_complete: Optional[Callable] = None,
     description: str = "",
+    session_id: str = "",
 ) -> Task:
     """Create and launch a new task.
 
@@ -634,6 +641,7 @@ async def dispatch(
         on_complete: Optional callback(task) called when task finishes,
                      fails, or needs user input.
         description: Optional short description. Auto-generated from prompt if empty.
+        session_id: Optional session ID to resume an existing Claude session.
 
     Returns:
         The newly created Task (already scheduled in the background).
@@ -645,6 +653,7 @@ async def dispatch(
         status="pending",
         description=description or _generate_description(prompt),
         current_step="Waiting in queue",
+        session_id=session_id,
         cwd=cwd or "",
         created_at=time.time(),
     )
@@ -1012,7 +1021,7 @@ async def recover_task(
     _save_tasks()
     _clear_checkpoint(task_id)
 
-    # Build the recovery prompt
+    # Build the recovery dispatch
     if mode == "resume" and task.session_id:
         # Resume: use existing session, ask to continue
         new_task = await dispatch(
@@ -1021,9 +1030,21 @@ async def recover_task(
             task_type=task.task_type,
             on_complete=on_complete,
             description=f"[resumed] {task.description}",
+            session_id=task.session_id,
         )
-        # Inject the session_id so it resumes the same Claude session
-        new_task.session_id = task.session_id
+    elif mode == "resume" and not task.session_id:
+        # Resume requested but no session — fall back to retry
+        logger.warning(
+            "Task %s: resume requested but no session_id — falling back to retry",
+            task_id[:8],
+        )
+        new_task = await dispatch(
+            prompt=task.prompt,
+            cwd=task.cwd,
+            task_type=task.task_type,
+            on_complete=on_complete,
+            description=f"[retried] {task.description}",
+        )
     else:
         # Retry: fresh start
         new_task = await dispatch(
@@ -1197,7 +1218,7 @@ def get_daemons_text() -> str:
 
 def _reset() -> None:
     """Reset all internal state. Used by tests only."""
-    global _worker_semaphore, _daemon_semaphore, _TASKS_FILE
+    global _worker_semaphore, _daemon_semaphore, _TASKS_FILE, _CHECKPOINT_DIR
     _tasks.clear()
     for h in _background_handles.values():
         if not h.done():
@@ -1205,6 +1226,8 @@ def _reset() -> None:
     _background_handles.clear()
     _worker_semaphore = None
     _daemon_semaphore = None
-    # Redirect persistence to a temp file to avoid polluting production data
+    # Redirect persistence to temp paths to avoid polluting production data
     _TASKS_FILE = Path("/tmp/supervisor-tasks-test.json")
     _TASKS_FILE.unlink(missing_ok=True)
+    _CHECKPOINT_DIR = Path("/tmp/supervisor-checkpoints-test")
+    _CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
