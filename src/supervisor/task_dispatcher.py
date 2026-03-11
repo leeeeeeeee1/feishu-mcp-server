@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 SUPERVISOR_MAX_WORKERS = int(os.environ.get("SUPERVISOR_MAX_WORKERS", "3"))
 SUPERVISOR_MAX_DAEMONS = int(os.environ.get("SUPERVISOR_MAX_DAEMONS", "2"))
 
+# asyncio StreamReader default limit is 64KB — too small for claude stream-json
+# which can emit single lines >64KB (e.g. large code blocks). 10MB is safe.
+_STREAM_LIMIT = 10 * 1024 * 1024  # 10 MB
+
 # Phrases that hint Claude is asking for user input
 _INPUT_PHRASES = ("please", "which", "should i", "confirm")
 
@@ -32,6 +36,78 @@ def _looks_like_needs_input(text: str) -> bool:
         return False
     lower = text.lower()
     return any(phrase in lower for phrase in _INPUT_PHRASES)
+
+
+# Phrases that indicate user acknowledges / wants to close
+_CLOSE_PHRASES = (
+    "好的", "收到", "ok", "谢谢", "thanks", "可以了", "没问题",
+    "完成", "done", "lgtm", "不用了", "就这样", "👍", "thank you",
+)
+
+
+_CLOSE_PHRASES_SET = frozenset(p.lower() for p in _CLOSE_PHRASES)
+
+
+import re as _re
+
+# Technical nouns — if these appear near 关闭/关掉/结束, it's NOT task closure
+_TECHNICAL_NOUNS = r"连接|端口|服务|进程|窗口|文件|通道|线程|循环|socket|server|session|db|数据库|nginx|redis"
+
+_CLOSE_FALSE_POSITIVES = _re.compile(
+    rf"关闭({_TECHNICAL_NOUNS})"
+    rf"|关掉({_TECHNICAL_NOUNS})"
+    rf"|结束({_TECHNICAL_NOUNS})"
+    rf"|({_TECHNICAL_NOUNS})关掉"
+    rf"|({_TECHNICAL_NOUNS})关闭"
+    rf"|({_TECHNICAL_NOUNS})结束",
+    _re.IGNORECASE,
+)
+
+_CLOSE_INTENT_PATTERNS = [
+    _re.compile(r"关闭(了|吧|这个|那个)"),  # 关闭了/关闭吧/关闭这个/关闭那个
+    _re.compile(r"关了"),
+    _re.compile(r"关掉"),
+    _re.compile(r"结束(吧|了|掉|这个|那个|任务)"),  # anchored: require suffix
+    _re.compile(r"不用了"),
+    _re.compile(r"完事了"),
+    _re.compile(r"可以关了"),
+    _re.compile(r"\bclose\b", _re.IGNORECASE),
+    _re.compile(r"\bdone with it\b", _re.IGNORECASE),
+]
+
+
+def _contains_close_intent(text: str) -> bool:
+    """Detect close intent in longer text (not just short phrases).
+
+    Unlike _looks_like_close (≤10 char exact match), this works on any
+    length text. Conservative: excludes technical phrases like "关闭连接".
+    """
+    if not text or not text.strip():
+        return False
+    if _CLOSE_FALSE_POSITIVES.search(text):
+        return False
+    return any(pat.search(text) for pat in _CLOSE_INTENT_PATTERNS)
+
+
+def _looks_like_close(text: str) -> bool:
+    """Heuristic: short acknowledgement → close intent, not follow-up.
+
+    Uses exact match after normalization to avoid false positives like
+    "not ok" or "I am done".
+    """
+    stripped = text.strip()
+    if not stripped:
+        return False
+    # Questions are never close intent
+    if "?" in stripped or "？" in stripped or "吗" in stripped:
+        return False
+    # Strip trailing punctuation for matching
+    normalized = stripped.lower().rstrip("。.!！~，,").strip()
+    # Short messages only (≤10 unicode chars)
+    if len(normalized) > 10:
+        return False
+    # Exact match against known close phrases
+    return normalized in _CLOSE_PHRASES_SET
 
 
 def _build_env() -> dict[str, str]:
@@ -132,6 +208,19 @@ def _save_tasks() -> None:
 
 def _load_tasks() -> None:
     """Load tasks from disk on startup."""
+    # Clean up orphaned .tmp file from interrupted save
+    tmp = _TASKS_FILE.with_suffix(".tmp")
+    if tmp.exists() and not _TASKS_FILE.exists():
+        try:
+            tmp.rename(_TASKS_FILE)
+        except OSError:
+            pass
+    elif tmp.exists():
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
     if not _TASKS_FILE.exists():
         return
     try:
@@ -139,9 +228,15 @@ def _load_tasks() -> None:
         for tid, d in data.items():
             # Skip completed/cancelled tasks older than 24h
             if d.get("status") in ("completed", "cancelled"):
-                if time.time() - d.get("finished_at", 0) > 86400:
+                finished = d.get("finished_at") or 0
+                if time.time() - finished > 86400:
                     continue
-            task = Task(**{k: v for k, v in d.items() if k in Task.__dataclass_fields__})
+            # Coerce float fields that may be None from JSON
+            filtered = {k: v for k, v in d.items() if k in Task.__dataclass_fields__}
+            for float_field in ("created_at", "started_at", "finished_at"):
+                if float_field in filtered and filtered[float_field] is None:
+                    filtered[float_field] = 0.0
+            task = Task(**filtered)
             # Tasks that were running when we crashed → mark as failed
             if task.status in ("running", "pending"):
                 task.status = "failed"
@@ -181,35 +276,26 @@ def _set_status(task: Task, new_status: str) -> None:
 # ── Core subprocess runner ──
 
 
-async def _run_claude(task: Task) -> None:
-    """Execute `claude -p` for *task* using streaming to track progress."""
+async def _run_claude_streaming(task: Task, env: dict) -> bool:
+    """Try to execute task via streaming. Returns True on success, False if fallback needed."""
     cmd = _build_cmd_streaming(task.prompt, session_id=task.session_id or None)
-    env = _build_env()
-
-    _set_status(task, "running")
-    task.current_step = "Starting Claude..."
-    task.started_at = time.time()
 
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=_STREAM_LIMIT,
             env=env,
             cwd=task.cwd or None,
         )
     except FileNotFoundError:
         task.error = "'claude' command not found"
-        task.finished_at = time.time()
-        _set_status(task, "failed")
-        return
+        return False
     except Exception as exc:  # noqa: BLE001
         task.error = str(exc)
-        task.finished_at = time.time()
-        _set_status(task, "failed")
-        return
+        return False
 
-    # Stream stdout to track progress in real-time
     accumulated_text = ""
     try:
         async for raw_line in proc.stdout:
@@ -223,7 +309,6 @@ async def _run_claude(task: Task) -> None:
 
             event_type = data.get("type", "")
 
-            # Capture session ID
             sid = data.get("session_id", "")
             if sid and not task.session_id:
                 task.session_id = sid
@@ -255,21 +340,98 @@ async def _run_claude(task: Task) -> None:
 
     except Exception as exc:  # noqa: BLE001
         task.error = str(exc)
-        task.finished_at = time.time()
-        _set_status(task, "failed")
-        return
+        return False
 
     await proc.wait()
 
     if proc.returncode != 0:
         stderr_data = await proc.stderr.read()
         task.error = stderr_data.decode("utf-8", errors="replace").strip() or "unknown error"
+        logger.warning(
+            "Task %s streaming failed (code %d): %s",
+            task.id[:8], proc.returncode, task.error[:300],
+        )
+        return False
+
+    if not task.result:
+        task.result = accumulated_text or ""
+
+    return True
+
+
+async def _run_claude_non_streaming(task: Task, env: dict) -> bool:
+    """Execute task via non-streaming JSON mode. Returns True on success."""
+    cmd = _build_cmd(task.prompt, session_id=task.session_id or None)
+    task.current_step = "Running (non-streaming fallback)..."
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=_STREAM_LIMIT,
+            env=env,
+            cwd=task.cwd or None,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
+    except asyncio.TimeoutError:
+        task.error = "Timed out (10 min limit)"
+        return False
+    except FileNotFoundError:
+        task.error = "'claude' command not found"
+        return False
+    except Exception as exc:  # noqa: BLE001
+        task.error = str(exc)
+        return False
+
+    if proc.returncode != 0:
+        task.error = stderr.decode("utf-8", errors="replace").strip() or "unknown error"
+        logger.error(
+            "Task %s non-streaming failed (code %d): %s",
+            task.id[:8], proc.returncode, task.error[:500],
+        )
+        return False
+
+    try:
+        data = json.loads(stdout.decode("utf-8"))
+        task.result = data.get("result", "") or "(empty response)"
+        sid = data.get("session_id", "")
+        if sid:
+            task.session_id = sid
+    except (json.JSONDecodeError, TypeError):
+        task.result = stdout.decode("utf-8", errors="replace").strip() or "(empty response)"
+
+    return True
+
+
+async def _run_claude(task: Task) -> None:
+    """Execute `claude -p` for a task.
+
+    Strategy: try streaming first (for progress tracking), fall back to
+    non-streaming if streaming crashes (e.g. HTTP chunk size errors).
+    """
+    env = _build_env()
+
+    _set_status(task, "running")
+    task.current_step = "Starting Claude..."
+    task.started_at = time.time()
+
+    # Try streaming first
+    success = await _run_claude_streaming(task, env)
+
+    if not success:
+        # Streaming failed — retry with non-streaming
+        logger.info(
+            "Task %s: streaming failed, retrying non-streaming. error=%s",
+            task.id[:8], (task.error or "")[:200],
+        )
+        task.error = ""  # clear streaming error
+        success = await _run_claude_non_streaming(task, env)
+
+    if not success:
         task.finished_at = time.time()
         _set_status(task, "failed")
         return
-
-    if not task.result:
-        task.result = accumulated_text or "(empty response)"
 
     task.finished_at = time.time()
     task.current_step = "Finished"
@@ -358,6 +520,7 @@ async def dispatch(
     task_type: str = "oneshot",
     chat_id: Optional[str] = None,
     on_complete: Optional[Callable] = None,
+    description: str = "",
 ) -> Task:
     """Create and launch a new task.
 
@@ -368,6 +531,7 @@ async def dispatch(
         chat_id: Optional Feishu chat ID for notifications.
         on_complete: Optional callback(task) called when task finishes,
                      fails, or needs user input.
+        description: Optional short description. Auto-generated from prompt if empty.
 
     Returns:
         The newly created Task (already scheduled in the background).
@@ -377,7 +541,7 @@ async def dispatch(
         prompt=prompt,
         task_type=task_type,
         status="pending",
-        description=_generate_description(prompt),
+        description=description or _generate_description(prompt),
         current_step="Waiting in queue",
         cwd=cwd or "",
         created_at=time.time(),
@@ -424,6 +588,7 @@ async def resume_task(task_id: str, user_input: str) -> str:
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=_STREAM_LIMIT,
             env=env,
             cwd=task.cwd or None,
         )
@@ -498,6 +663,11 @@ def _validate_follow_up(task_id: str) -> "Task":
         )
     if not task.session_id:
         raise ValueError(f"Task {task_id[:8]} has no session to resume")
+    # claude --resume requires a valid UUID
+    if task.session_id.count("-") != 4 or len(task.session_id) != 36:
+        raise ValueError(
+            f"Task {task_id[:8]} has invalid session_id: {task.session_id!r}"
+        )
 
     return task
 
@@ -505,27 +675,42 @@ def _validate_follow_up(task_id: str) -> "Task":
 async def follow_up_async(task_id: str, user_input: str) -> str:
     """Execute follow-up on a task's existing session.
 
+    Tries streaming first for progress tracking, falls back to non-streaming.
     Returns the response text.
     """
     task = _validate_follow_up(task_id)
 
     _set_status(task, "follow_up")
     task.current_step = f"Follow-up: {user_input[:60]}"
-
-    cmd = _build_cmd_streaming(user_input, session_id=task.session_id)
     env = _build_env()
+
+    result = await _follow_up_streaming(task, user_input, env)
+    if result is None:
+        logger.info("Task %s follow-up: streaming failed, retrying non-streaming", task.id[:8])
+        result = await _follow_up_non_streaming(task, user_input, env)
+
+    task.result = result or "(empty response)"
+    _set_status(task, "awaiting_closure")
+    task.current_step = "Done — awaiting user confirmation to close"
+    return task.result
+
+
+async def _follow_up_streaming(task: Task, user_input: str, env: dict) -> Optional[str]:
+    """Try follow-up via streaming. Returns result text or None on failure."""
+    cmd = _build_cmd_streaming(user_input, session_id=task.session_id)
 
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=_STREAM_LIMIT,
             env=env,
             cwd=task.cwd or None,
         )
     except Exception as exc:
-        _set_status(task, "awaiting_closure")
-        return f"Error: {exc}"
+        logger.warning("Follow-up streaming spawn failed: %s", exc)
+        return None
 
     accumulated_text = ""
     try:
@@ -551,15 +736,49 @@ async def follow_up_async(task_id: str, user_input: str) -> str:
                 accumulated_text = data.get("result", "") or accumulated_text
                 break
     except Exception as exc:
-        _set_status(task, "awaiting_closure")
-        return f"Error during follow-up: {exc}"
+        logger.warning("Follow-up streaming error: %s", exc)
+        return None
 
     await proc.wait()
+    if proc.returncode != 0:
+        stderr_data = await proc.stderr.read()
+        logger.warning(
+            "Follow-up streaming failed (code %d): %s",
+            proc.returncode, stderr_data.decode("utf-8", errors="replace")[:300],
+        )
+        return None
 
-    task.result = accumulated_text or "(empty response)"
-    _set_status(task, "awaiting_closure")
-    task.current_step = "Done — awaiting user confirmation to close"
-    return task.result
+    return accumulated_text or "(empty response)"
+
+
+async def _follow_up_non_streaming(task: Task, user_input: str, env: dict) -> Optional[str]:
+    """Follow-up via non-streaming JSON mode (fallback)."""
+    cmd = _build_cmd(user_input, session_id=task.session_id)
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=_STREAM_LIMIT,
+            env=env,
+            cwd=task.cwd or None,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
+    except Exception as exc:
+        logger.error("Follow-up non-streaming failed: %s", exc)
+        return f"Error: {exc}"
+
+    if proc.returncode != 0:
+        err = stderr.decode("utf-8", errors="replace").strip()
+        logger.error("Follow-up non-streaming error (code %d): %s", proc.returncode, err[:300])
+        return f"Error: {err}"
+
+    try:
+        data = json.loads(stdout.decode("utf-8"))
+        return data.get("result", "") or "(empty response)"
+    except (json.JSONDecodeError, TypeError):
+        return stdout.decode("utf-8", errors="replace").strip() or "(empty response)"
 
 
 def close_task(task_id: str) -> str:
@@ -775,7 +994,7 @@ def get_daemons_text() -> str:
 
 def _reset() -> None:
     """Reset all internal state. Used by tests only."""
-    global _worker_semaphore, _daemon_semaphore
+    global _worker_semaphore, _daemon_semaphore, _TASKS_FILE
     _tasks.clear()
     for h in _background_handles.values():
         if not h.done():
@@ -783,3 +1002,6 @@ def _reset() -> None:
     _background_handles.clear()
     _worker_semaphore = None
     _daemon_semaphore = None
+    # Redirect persistence to a temp file to avoid polluting production data
+    _TASKS_FILE = Path("/tmp/supervisor-tasks-test.json")
+    _TASKS_FILE.unlink(missing_ok=True)

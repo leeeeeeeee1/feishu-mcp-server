@@ -92,6 +92,63 @@ class TestTaskContext:
         assert "bbbb2222" in prompt
 
 
+class TestConversationHistory:
+    """Test that conversation history is injected into the route prompt."""
+
+    def test_no_history_no_section(self):
+        prompt = build_route_prompt("test")
+        assert "## Recent conversation history" not in prompt
+
+    def test_empty_string_no_section(self):
+        prompt = build_route_prompt("test", conversation_history="")
+        assert "## Recent conversation history" not in prompt
+
+    def test_history_included_when_provided(self):
+        history = "User: 你好\nAssistant: 你好！有什么可以帮你的？"
+        prompt = build_route_prompt("继续", conversation_history=history)
+        assert "## Recent conversation history" in prompt
+        assert "User: 你好" in prompt
+        assert "Assistant: 你好！有什么可以帮你的？" in prompt
+
+    def test_history_appears_before_user_message(self):
+        history = "User: 之前的消息"
+        prompt = build_route_prompt("新消息", conversation_history=history)
+        history_pos = prompt.index("## Recent conversation history")
+        msg_pos = prompt.index("<user_message>")
+        assert history_pos < msg_pos
+
+    def test_history_with_tasks(self):
+        active = [{"id": "aaaa1111", "status": "running", "description": "任务A"}]
+        history = "User: 上一条消息"
+        prompt = build_route_prompt(
+            "test", active_tasks=active, conversation_history=history,
+        )
+        assert "## Currently active tasks" in prompt
+        assert "## Recent conversation history" in prompt
+        assert "aaaa1111" in prompt
+        assert "上一条消息" in prompt
+
+
+class TestCloseAction:
+    """Test that close action is defined in routing rules, examples, and format."""
+
+    def test_rules_mention_close_action(self):
+        assert 'action = "close"' in ROUTING_RULES
+
+    def test_examples_have_close_cases(self):
+        assert '"close"' in ROUTING_EXAMPLES
+
+    def test_close_format_in_prompt(self):
+        prompt = build_route_prompt("关闭这个任务")
+        assert '"close"' in prompt
+        assert "task_id" in prompt
+
+    def test_close_replaces_old_rule_6(self):
+        """Old rule 6 told users to use /close <id>. It should be gone."""
+        assert '使用 /close' not in ROUTING_RULES
+        assert 'tell them to use /close' not in ROUTING_RULES
+
+
 class TestSupervisorIdentity:
     """Test the identity string for sonnet's reply generation."""
 

@@ -188,6 +188,7 @@ class ClaudeSession:
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=10 * 1024 * 1024,  # 10 MB — match task_dispatcher
                 env=env,
                 cwd=cwd,
             )
@@ -248,6 +249,7 @@ class ClaudeSession:
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=10 * 1024 * 1024,  # 10 MB — match task_dispatcher
                 env=env,
                 cwd=cwd,
             )
@@ -280,14 +282,18 @@ class ClaudeSession:
             return text or "(empty response)"
 
     # Valid actions that sonnet can return
-    _VALID_ACTIONS = frozenset({"reply", "dispatch", "dispatch_multi", "follow_up"})
+    _VALID_ACTIONS = frozenset({"reply", "dispatch", "dispatch_multi", "follow_up", "close"})
 
-    async def route_message(self, text: str, route_prompt: str) -> dict:
+    # Route model — sonnet via direct API (fast) or CLI fallback
+    _ROUTE_MODEL = "claude-sonnet-4-6"
+
+    async def route_message(self, text: str, system_prompt: str, user_prompt: str) -> dict:
         """Route a user message using sonnet — classify AND generate response in one call.
 
         Args:
-            text: The user message.
-            route_prompt: The full routing prompt (from build_route_prompt).
+            text: The user message (for fallback description).
+            system_prompt: Stable routing rules (cacheable).
+            user_prompt: Dynamic context + user message.
 
         Returns a dict with:
             - {"action": "reply", "text": "..."} for direct responses
@@ -297,39 +303,19 @@ class ClaudeSession:
 
         Falls back to action=dispatch on any error (safe default).
         """
-        cmd = [
-            "claude", "-p", route_prompt,
-            "--model", "sonnet",
-            "--output-format", "json",
-        ]
-
-        env = _build_env()
         logger.info("Routing message: %s", text[:80])
 
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
-        except asyncio.TimeoutError:
-            logger.warning("Route call timed out (60s), defaulting to dispatch")
-            return {"action": "dispatch", "description": text[:80]}
-        except (FileNotFoundError, OSError) as e:
-            logger.warning("Route call failed: %s, defaulting to dispatch", e)
+        # Try direct API first (much faster, no CLI overhead)
+        result_text = await self._route_via_api(system_prompt, user_prompt)
+
+        # Fallback to CLI if API not available
+        if result_text is None:
+            combined = system_prompt + "\n" + user_prompt
+            result_text = await self._route_via_cli(text, combined)
+
+        if result_text is None:
             return {"action": "dispatch", "description": text[:80]}
 
-        # ── Parse outer JSON from `claude --output-format json`
-        try:
-            data = json.loads(stdout.decode("utf-8"))
-        except (json.JSONDecodeError, TypeError) as e:
-            raw = stdout.decode("utf-8", errors="replace")[:200]
-            logger.warning("Route outer parse error: %s, raw: %s", e, raw)
-            return {"action": "dispatch", "description": text[:80]}
-
-        result_text = data.get("result", "")
         result_text = self._strip_markdown_wrapper(result_text)
 
         if not result_text.strip():
@@ -346,14 +332,126 @@ class ClaudeSession:
         if parsed:
             return parsed
 
-        # ── Try 3: Plain text → treat as reply (sonnet ignored JSON instruction)
+        # ── Try 3: Plain text heuristic (sonnet ignored JSON instruction)
         if not result_text.strip().startswith("{"):
-            logger.info("Sonnet returned plain text, treating as reply: %s", result_text[:100])
-            return {"action": "reply", "text": result_text.strip()}
+            plain = result_text.strip()
+            _ACTION_VERBS = re.compile(
+                r"(执行|分析|运行|检查|创建|编写|部署|安装|配置|重构|优化|修复"
+                r"|run|check|analyze|build|deploy|install|fix|create|write|refactor)",
+                re.IGNORECASE,
+            )
+            if len(plain) < 200 and _ACTION_VERBS.search(plain):
+                logger.info("Sonnet returned plain text with action verbs, treating as dispatch: %s", plain[:100])
+                return {"action": "dispatch", "description": plain}
+            logger.info("Sonnet returned plain text, treating as reply: %s", plain[:100])
+            return {"action": "reply", "text": plain}
 
         # ── Fallback: dispatch (safe default)
         logger.warning("Could not parse route result, defaulting to dispatch. Raw: %s", result_text[:200])
         return {"action": "dispatch", "description": text[:80]}
+
+    @staticmethod
+    def _resolve_api_key() -> str:
+        """Resolve Anthropic API key from environment or Claude Code config.
+
+        Checks in order:
+        1. ANTHROPIC_API_KEY environment variable
+        2. primaryApiKey in ~/.claude.json (Claude Code's stored key)
+        """
+        key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        if key:
+            return key
+
+        try:
+            config_path = Path.home() / ".claude.json"
+            if config_path.exists():
+                data = json.loads(config_path.read_text())
+                key = data.get("primaryApiKey", "").strip()
+                if key:
+                    return key
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+
+        return ""
+
+    async def _route_via_api(self, system_prompt: str, user_prompt: str) -> Optional[str]:
+        """Route via direct Anthropic API call (fast, no CLI overhead).
+
+        Args:
+            system_prompt: Stable routing rules (cacheable).
+            user_prompt: Dynamic context + user message.
+
+        Returns the response text, or None if API is not available.
+        """
+        try:
+            import anthropic
+        except ImportError:
+            return None
+
+        api_key = self._resolve_api_key()
+        if not api_key:
+            return None
+
+        try:
+            client = anthropic.AsyncAnthropic(api_key=api_key)
+            response = await asyncio.wait_for(
+                client.messages.create(
+                    model=self._ROUTE_MODEL,
+                    max_tokens=2048,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_prompt}],
+                ),
+                timeout=30,
+            )
+            result = response.content[0].text if response.content else ""
+            logger.info("Route via API: %d input tokens, %d output tokens",
+                        response.usage.input_tokens, response.usage.output_tokens)
+            return result
+        except asyncio.TimeoutError:
+            logger.warning("Route API timed out (30s)")
+            return None
+        except Exception as e:
+            logger.info("Route API unavailable (%s), falling back to CLI", type(e).__name__)
+            return None
+
+    async def _route_via_cli(self, text: str, combined_prompt: str) -> Optional[str]:
+        """Route via claude CLI (fallback when API is not available).
+
+        Returns the result text, or None on failure.
+        """
+        cmd = [
+            "claude", "-p", combined_prompt,
+            "--model", "sonnet",
+            "--effort", "low",
+            "--output-format", "json",
+            "--allowedTools", "",
+        ]
+
+        env = _build_env()
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        except asyncio.TimeoutError:
+            logger.warning("Route CLI timed out (60s)")
+            return None
+        except (FileNotFoundError, OSError) as e:
+            logger.warning("Route CLI failed: %s", e)
+            return None
+
+        try:
+            data = json.loads(stdout.decode("utf-8"))
+        except (json.JSONDecodeError, TypeError) as e:
+            raw = stdout.decode("utf-8", errors="replace")[:200]
+            logger.warning("Route CLI parse error: %s, raw: %s", e, raw)
+            return None
+
+        return data.get("result", "")
 
     def _try_json_parse(self, text: str) -> Optional[dict]:
         """Try standard JSON parse. Returns parsed dict or None."""
@@ -399,7 +497,11 @@ class ClaudeSession:
 
         elif action == "dispatch_multi":
             desc = self._extract_field_value(text, "description")
-            # For dispatch_multi, subtasks are hard to extract with regex — fallback
+            subtasks_match = re.search(r'"subtasks"\s*:\s*\[(.*?)\]', text, re.DOTALL)
+            if subtasks_match:
+                subtasks = re.findall(r'"([^"]+)"', subtasks_match.group(1))
+                if subtasks:
+                    return {"action": "dispatch_multi", "description": desc or "", "subtasks": subtasks}
             return {"action": "dispatch", "description": desc or ""}
 
         logger.info("Regex extracted action=%s from malformed JSON", action)

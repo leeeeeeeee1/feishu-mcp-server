@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import threading
@@ -23,7 +24,8 @@ from typing import Optional
 
 from .claude_session import ClaudeSession, StreamEvent
 from .feishu_gateway import FeishuGateway
-from .router_skill import build_route_prompt
+from .router_skill import build_route_prompt, build_route_system_prompt, build_route_user_prompt
+from .task_dispatcher import _looks_like_close, _contains_close_intent
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +44,18 @@ RULES:
 class Supervisor:
     """Main supervisor daemon orchestrating all components."""
 
+    # Statuses that are fully terminal — invisible to sonnet.
+    _TERMINAL_STATUSES = frozenset({"completed", "cancelled"})
+
+    # Human-readable notes for non-obvious statuses.
+    _STATUS_NOTES = {
+        "waiting_for_input": "Needs user input",
+        "follow_up": "正在执行追问",
+        "review": "等待人工审核",
+        "learning": "正在提取经验",
+        "done": "执行完成，等待关闭",
+    }
+
     MAX_HISTORY = 20  # keep last N messages
 
     def __init__(self):
@@ -50,7 +64,8 @@ class Supervisor:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown = asyncio.Event()
         self._conversation_history: list[dict[str, str]] = []
-        self._read_messages: set[str] = set()  # message_ids confirmed read by user
+        self._read_messages: dict[str, float] = {}  # message_id -> timestamp, ordered by insertion
+        self._message_task_map: dict[str, str] = {}  # feishu_message_id → task_id
 
         # Monitors
         try:
@@ -106,6 +121,8 @@ class Supervisor:
             except Exception as e:
                 result = f"Error: {e}"
             self.gateway.reply_message(message_id, result)
+            self._record_message("user", cmd)
+            self._record_message("assistant", result[:500])
             return True
         return False
 
@@ -262,24 +279,23 @@ class Supervisor:
     def _extract_task_id_from_text(self, text: str) -> Optional[str]:
         """Try to find a task ID prefix (8-char hex) in the message text.
 
-        Returns the matched task ID (full UUID) if found and in awaiting_closure,
+        Returns the matched task ID (full UUID) if found and in a matchable
+        status (running, pending, failed, waiting_for_input, awaiting_closure),
         or None.
         """
         if not self._task_dispatcher:
             return None
 
-        import re
-        # Match 8+ hex chars that could be a task ID prefix
         candidates = re.findall(r'\b([0-9a-f]{8,})\b', text.lower())
         if not candidates:
             return None
 
-        awaiting = {
+        matchable = {
             t.id: t for t in self._task_dispatcher.list_tasks()
-            if t.status == "awaiting_closure"
+            if t.status not in self._TERMINAL_STATUSES
         }
         for candidate in candidates:
-            for task_id in awaiting:
+            for task_id in matchable:
                 if task_id.startswith(candidate) or task_id.replace("-", "").startswith(candidate):
                     return task_id
         return None
@@ -287,9 +303,12 @@ class Supervisor:
     def _get_tasks_context(self) -> dict:
         """Build task context for the sonnet route prompt.
 
+        Uses EXCLUSION approach: all statuses visible EXCEPT terminal ones
+        (completed, cancelled). New statuses are visible by default.
+
         Returns dict with:
             "awaiting": list of awaiting_closure tasks
-            "active": list of running/pending tasks (with progress details)
+            "active": list of all non-terminal, non-awaiting tasks
         """
         if not self._task_dispatcher:
             return {"awaiting": [], "active": []}
@@ -301,7 +320,7 @@ class Supervisor:
         ]
         active = []
         for t in tasks:
-            if t.status not in ("running", "pending"):
+            if t.status in self._TERMINAL_STATUSES or t.status == "awaiting_closure":
                 continue
             info = {
                 "id": t.id[:8],
@@ -315,41 +334,87 @@ class Supervisor:
             if t.started_at:
                 elapsed = int(time.time() - t.started_at)
                 info["elapsed"] = f"{elapsed}s" if elapsed < 60 else f"{elapsed // 60}m{elapsed % 60}s"
+            if t.status == "failed" and t.error:
+                info["error"] = t.error[:120]
+            note = self._STATUS_NOTES.get(t.status)
+            if note:
+                info["note"] = note
             active.append(info)
         return {"awaiting": awaiting, "active": active}
 
     async def _route_message(
-        self, text: str, chat_id: str, message_id: str
+        self, text: str, chat_id: str, message_id: str,
+        parent_id: str = "",
     ):
         """Route incoming message via sonnet.
 
+        0. Reply to task result message (parent_id match) → direct follow-up
         1. Explicit task ID in message → direct follow-up
         2. Sonnet classifies (with awaiting task context) → reply/dispatch/follow_up
         """
-        # ── Step 1: Explicit task ID → direct follow-up
+        # ── Step 0: Reply-based follow-up or close (parent_id → task mapping)
+        if parent_id and parent_id in self._message_task_map:
+            task_id = self._message_task_map[parent_id]
+            if self._task_dispatcher:
+                task = self._task_dispatcher.get_task(task_id)
+                if task and task.status == "awaiting_closure":
+                    self._record_message("user", text)
+                    # Short acknowledgement → close task
+                    if _looks_like_close(text):
+                        logger.info(
+                            "Reply-based close: parent=%s → task %s",
+                            parent_id, task.id[:8],
+                        )
+                        try:
+                            self._task_dispatcher.close_task(task.id)
+                        except ValueError as e:
+                            self.gateway.reply_message(message_id, f"关闭失败: {e}")
+                            return
+                        reply_text = f"任务 [{task.id[:8]}] 已关闭"
+                        self.gateway.reply_message(message_id, reply_text)
+                        self._record_message("assistant", reply_text)
+                        return
+                    # Otherwise → follow-up
+                    logger.info(
+                        "Reply-based follow-up: parent=%s → task %s",
+                        parent_id, task.id[:8],
+                    )
+                    await self._handle_follow_up(task, text, chat_id, message_id)
+                    self._record_message("assistant", f"[follow-up sent to {task.id[:8]}]")
+                    return
+
+        # ── Step 1: Explicit task ID → direct follow-up (awaiting_closure only)
         matched_task_id = self._extract_task_id_from_text(text)
         if matched_task_id:
             task = self._task_dispatcher.get_task(matched_task_id)
-            if task.status == "awaiting_closure":
+            if task and task.status == "awaiting_closure":
                 logger.info(
                     "Explicit task ID match, follow-up to %s: %s",
                     task.id[:8], text[:60],
                 )
                 self._record_message("user", text)
                 await self._handle_follow_up(task, text, chat_id, message_id)
+                self._record_message("assistant", f"[follow-up sent to {task.id[:8]}]")
                 return
+            elif task:
+                logger.info(
+                    "Explicit task ID match (%s) but status=%s, passing to sonnet",
+                    task.id[:8], task.status,
+                )
 
         # ── Step 2: Record user message
         self._record_message("user", text)
 
         # ── Step 3: Sonnet classify + respond (with task context)
         tasks_ctx = self._get_tasks_context()
-        route_prompt = build_route_prompt(
+        system_prompt = build_route_system_prompt()
+        user_prompt = build_route_user_prompt(
             text,
             awaiting_tasks=tasks_ctx["awaiting"] or None,
             active_tasks=tasks_ctx["active"] or None,
+            conversation_history=self._get_history_text(),
         )
-        result = await self.claude.route_message(text, route_prompt)
+        result = await self.claude.route_message(text, system_prompt, user_prompt)
         action = result.get("action", "dispatch")
         logger.info("Route result: action=%s result=%s", action, str(result)[:200])
 
@@ -359,6 +424,9 @@ class Supervisor:
                 reply_text = "收到，有什么可以帮你的？"
             self.gateway.reply_message(message_id, reply_text)
             self._record_message("assistant", reply_text)
+
+        elif action == "close":
+            await self._handle_sonnet_close(result, chat_id, message_id)
 
         elif action == "follow_up":
             await self._handle_sonnet_follow_up(result, text, chat_id, message_id)
@@ -450,6 +518,7 @@ class Supervisor:
             task_type="oneshot",
             chat_id=chat_id,
             on_complete=on_complete,
+            description=description,
         )
         logger.info("Dispatched: %s -> %s", task.id[:8], description)
 
@@ -484,6 +553,7 @@ class Supervisor:
                 task_type="oneshot",
                 chat_id=chat_id,
                 on_complete=on_complete,
+                description=sub_prompt[:80],
             )
             logger.info("Sub-task dispatched: %s -> %s", task.id[:8], sub_prompt[:60])
 
@@ -503,11 +573,14 @@ class Supervisor:
             return
 
         truncated = result[:3000] + ("..." if len(result) > 3000 else "")
-        self.gateway.send_message(
+        sent_msg_id = self.gateway.send_message(
             chat_id,
             f"📎 追问回复 [{task.id[:8]}]\n\n{truncated}\n\n"
             f"继续追问或 /close {task.id[:8]} 关闭任务",
         )
+        # Track follow-up reply for chain replies
+        if sent_msg_id:
+            self._message_task_map[sent_msg_id] = task.id
 
     async def _handle_sonnet_follow_up(
         self, result: dict, text: str, chat_id: str, message_id: str
@@ -531,8 +604,53 @@ class Supervisor:
             return
 
         task = matching[0]
+
+        # Smart close fallback: if original user text contains close intent,
+        # close the task instead of following up (sonnet misclassification)
+        if _contains_close_intent(text):
+            logger.info(
+                "Smart close fallback: follow_up but text '%s' has close intent → closing %s",
+                text[:60], task.id[:8],
+            )
+            await self._handle_sonnet_close(
+                {"action": "close", "task_id": task_id_prefix}, chat_id, message_id,
+            )
+            return
+
         follow_up_text = result.get("text", text)
         await self._handle_follow_up(task, follow_up_text, chat_id, message_id)
+
+    async def _handle_sonnet_close(
+        self, result: dict, chat_id: str, message_id: str
+    ):
+        """Handle close action decided by sonnet."""
+        task_id_prefix = result.get("task_id", "")
+        if not task_id_prefix or not self._task_dispatcher:
+            self.gateway.reply_message(
+                message_id, "没有找到可关闭的任务，请用 /close <id> 指定。"
+            )
+            return
+
+        matching = [
+            t for t in self._task_dispatcher.list_tasks()
+            if t.id.startswith(task_id_prefix) and t.status == "awaiting_closure"
+        ]
+        if not matching:
+            self.gateway.reply_message(
+                message_id,
+                f"未找到匹配的待关闭任务 (id={task_id_prefix})，请用 /tasks 查看。",
+            )
+            return
+
+        task = matching[0]
+        try:
+            self._task_dispatcher.close_task(task.id)
+        except ValueError as e:
+            self.gateway.reply_message(message_id, f"关闭失败: {e}")
+            return
+        reply_text = f"任务 [{task.id[:8]}] 已关闭"
+        self.gateway.reply_message(message_id, reply_text)
+        self._record_message("assistant", reply_text)
 
     # ── Task Result Notification ──
 
@@ -571,8 +689,18 @@ class Supervisor:
         else:
             msg = f"ℹ️ 任务状态变更 [{tid}]: {task.status}{elapsed}"
 
+        self._record_message("assistant", msg[:500])
+
         try:
-            self.gateway.push_message(msg, chat_id=chat_id)
+            sent_msg_id = self.gateway.push_message(msg, chat_id=chat_id)
+            # Track message→task mapping for reply-based follow-up
+            if sent_msg_id and task.status == "awaiting_closure":
+                self._message_task_map[sent_msg_id] = task.id
+                # Cap the map to prevent unbounded growth
+                if len(self._message_task_map) > 500:
+                    oldest_keys = list(self._message_task_map.keys())[:-500]
+                    for k in oldest_keys:
+                        del self._message_task_map[k]
         except Exception as e:
             logger.error("Failed to notify task result: %s", e)
 
@@ -582,15 +710,15 @@ class Supervisor:
 
     def _on_message_read(self, reader_id: str, message_id_list: list[str], read_time: str):
         """Track which messages the user has read."""
+        now = time.time()
         for mid in message_id_list:
-            self._read_messages.add(mid)
+            self._read_messages[mid] = now
         logger.info("[READ] reader=%s read %d messages", reader_id, len(message_id_list))
-        # Cap the set to prevent unbounded growth
+        # Cap the dict — evict oldest entries (insertion-ordered in Python 3.7+)
         if len(self._read_messages) > 500:
-            # Keep only the most recent entries (set is unordered, just trim)
-            excess = len(self._read_messages) - 500
-            for _ in range(excess):
-                self._read_messages.pop()
+            keys = list(self._read_messages.keys())
+            for k in keys[:len(keys) - 500]:
+                del self._read_messages[k]
 
     def is_message_read(self, message_id: str) -> bool:
         """Check if a message has been read by the user."""
@@ -603,7 +731,9 @@ class Supervisor:
         chat_id: str,
         msg_type: str,
         content: str,
-        raw_event,
+        raw_event=None,
+        parent_id: str = "",
+        root_id: str = "",
     ):
         """Route incoming Feishu messages."""
         if not content or not content.strip():
@@ -620,10 +750,10 @@ class Supervisor:
             self._handle_local_command(text, chat_id, message_id)
             return
 
-        # Layer 2: Smart routing
+        # Layer 2: Smart routing (pass parent_id for reply-based follow-up)
         if self._loop:
             asyncio.run_coroutine_threadsafe(
-                self._route_message(text, chat_id, message_id),
+                self._route_message(text, chat_id, message_id, parent_id=parent_id),
                 self._loop,
             )
 

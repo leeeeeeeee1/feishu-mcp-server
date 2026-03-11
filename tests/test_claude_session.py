@@ -253,7 +253,7 @@ class TestClaudeSession:
 
             with patch("supervisor.claude_session.asyncio.create_subprocess_exec", return_value=mock_proc):
                 with patch("supervisor.claude_session.asyncio.wait_for", return_value=(stdout, b"")):
-                    result = await session.route_message("你好", "prompt")
+                    result = await session.route_message("你好", "system", "user")
                     assert result["action"] == "reply"
                     assert "Supervisor" in result["text"]
 
@@ -274,7 +274,7 @@ class TestClaudeSession:
 
             with patch("supervisor.claude_session.asyncio.create_subprocess_exec", return_value=mock_proc):
                 with patch("supervisor.claude_session.asyncio.wait_for", return_value=(stdout, b"")):
-                    result = await session.route_message("你好", "prompt")
+                    result = await session.route_message("你好", "system", "user")
                     assert result["action"] == "reply"
                     assert "Supervisor" in result["text"]
 
@@ -296,7 +296,7 @@ class TestClaudeSession:
 
             with patch("supervisor.claude_session.asyncio.create_subprocess_exec", return_value=mock_proc):
                 with patch("supervisor.claude_session.asyncio.wait_for", return_value=(stdout, b"")):
-                    result = await session.route_message("帮我分析代码", "prompt")
+                    result = await session.route_message("帮我分析代码", "system", "user")
                     assert result["action"] == "dispatch"
                     assert "分析" in result["description"]
 
@@ -318,7 +318,7 @@ class TestClaudeSession:
 
             with patch("supervisor.claude_session.asyncio.create_subprocess_exec", return_value=mock_proc):
                 with patch("supervisor.claude_session.asyncio.wait_for", return_value=(stdout, b"")):
-                    result = await session.route_message("hi", "prompt")
+                    result = await session.route_message("hi", "system", "user")
                     assert result["action"] == "reply"
 
         asyncio.run(_test())
@@ -340,7 +340,7 @@ class TestClaudeSession:
 
             with patch("supervisor.claude_session.asyncio.create_subprocess_exec", return_value=mock_proc):
                 with patch("supervisor.claude_session.asyncio.wait_for", return_value=(stdout, b"")):
-                    result = await session.route_message("为什么排队", "prompt")
+                    result = await session.route_message("为什么排队", "system", "user")
                     assert result["action"] == "reply"
                     # Should extract the text, not return raw JSON string
                     assert "排队" in result["text"]
@@ -364,7 +364,7 @@ class TestClaudeSession:
 
             with patch("supervisor.claude_session.asyncio.create_subprocess_exec", return_value=mock_proc):
                 with patch("supervisor.claude_session.asyncio.wait_for", return_value=(stdout, b"")):
-                    result = await session.route_message("分析核心模块", "prompt")
+                    result = await session.route_message("分析核心模块", "system", "user")
                     assert result["action"] == "dispatch"
 
         asyncio.run(_test())
@@ -385,7 +385,7 @@ class TestClaudeSession:
 
             with patch("supervisor.claude_session.asyncio.create_subprocess_exec", return_value=mock_proc):
                 with patch("supervisor.claude_session.asyncio.wait_for", return_value=(stdout, b"")):
-                    result = await session.route_message("结果对吗", "prompt")
+                    result = await session.route_message("结果对吗", "system", "user")
                     assert result["action"] == "follow_up"
                     assert result["task_id"] == "8b557777"
 
@@ -407,7 +407,7 @@ class TestClaudeSession:
 
             with patch("supervisor.claude_session.asyncio.create_subprocess_exec", return_value=mock_proc):
                 with patch("supervisor.claude_session.asyncio.wait_for", return_value=(stdout, b"")):
-                    result = await session.route_message("test", "prompt")
+                    result = await session.route_message("test", "system", "user")
                     assert result["action"] == "reply"
                     assert "第一行" in result["text"]
 
@@ -425,7 +425,7 @@ class TestClaudeSession:
                 mock_exec.return_value = mock_proc
                 with patch("supervisor.claude_session.asyncio.wait_for", side_effect=asyncio.TimeoutError):
                     mock_proc.kill = AsyncMock()
-                    result = await session.route_message("test", "prompt")
+                    result = await session.route_message("test", "system", "user")
                     assert result["action"] == "dispatch"
 
         asyncio.run(_test())
@@ -446,7 +446,7 @@ class TestClaudeSession:
 
             with patch("supervisor.claude_session.asyncio.create_subprocess_exec", return_value=mock_proc):
                 with patch("supervisor.claude_session.asyncio.wait_for", return_value=(stdout, b"")):
-                    result = await session.route_message("test", "prompt")
+                    result = await session.route_message("test", "system", "user")
                     assert result["action"] == "reply"
                     assert "A" in result["text"]
                     assert "B" in result["text"]
@@ -470,7 +470,7 @@ class TestClaudeSession:
 
             with patch("supervisor.claude_session.asyncio.create_subprocess_exec", return_value=mock_proc):
                 with patch("supervisor.claude_session.asyncio.wait_for", return_value=(stdout, b"")):
-                    result = await session.route_message("test", "prompt")
+                    result = await session.route_message("test", "system", "user")
                     assert result["action"] == "reply"
                     assert "原因如下" in result["text"]
 
@@ -493,10 +493,79 @@ class TestClaudeSession:
 
             with patch("supervisor.claude_session.asyncio.create_subprocess_exec", return_value=mock_proc):
                 with patch("supervisor.claude_session.asyncio.wait_for", return_value=(stdout, b"")):
-                    result = await session.route_message("test", "prompt")
+                    result = await session.route_message("test", "system", "user")
                     # Should fall back to dispatch, NOT send raw JSON as reply
                     assert result["action"] == "dispatch"
 
+        asyncio.run(_test())
+
+    def test_route_message_plain_text_action_verb_dispatches(self):
+        """Short plain text with action verbs → dispatch."""
+        import asyncio
+        async def _test():
+            session = ClaudeSession(session_id=None)
+            data = {"result": "帮我分析一下这段代码的性能问题"}
+            stdout = json.dumps(data).encode()
+            mock_proc = AsyncMock()
+            mock_proc.communicate = AsyncMock(return_value=(stdout, b""))
+            mock_proc.returncode = 0
+            with patch("supervisor.claude_session.asyncio.create_subprocess_exec", return_value=mock_proc):
+                with patch("supervisor.claude_session.asyncio.wait_for", return_value=(stdout, b"")):
+                    result = await session.route_message("分析代码", "system", "user")
+                    assert result["action"] == "dispatch"
+                    assert "分析" in result["description"]
+        asyncio.run(_test())
+
+    def test_route_message_plain_text_long_replies(self):
+        """Long plain text (>=200 chars) → reply even with action verbs."""
+        import asyncio
+        async def _test():
+            session = ClaudeSession(session_id=None)
+            long_text = "这是一段很长的分析结果，" * 20
+            data = {"result": long_text}
+            stdout = json.dumps(data).encode()
+            mock_proc = AsyncMock()
+            mock_proc.communicate = AsyncMock(return_value=(stdout, b""))
+            mock_proc.returncode = 0
+            with patch("supervisor.claude_session.asyncio.create_subprocess_exec", return_value=mock_proc):
+                with patch("supervisor.claude_session.asyncio.wait_for", return_value=(stdout, b"")):
+                    result = await session.route_message("test", "system", "user")
+                    assert result["action"] == "reply"
+        asyncio.run(_test())
+
+    def test_route_message_plain_text_no_verb_replies(self):
+        """Short plain text without action verbs → reply."""
+        import asyncio
+        async def _test():
+            session = ClaudeSession(session_id=None)
+            data = {"result": "你好！有什么可以帮你的？"}
+            stdout = json.dumps(data).encode()
+            mock_proc = AsyncMock()
+            mock_proc.communicate = AsyncMock(return_value=(stdout, b""))
+            mock_proc.returncode = 0
+            with patch("supervisor.claude_session.asyncio.create_subprocess_exec", return_value=mock_proc):
+                with patch("supervisor.claude_session.asyncio.wait_for", return_value=(stdout, b"")):
+                    result = await session.route_message("你好", "system", "user")
+                    assert result["action"] == "reply"
+        asyncio.run(_test())
+
+    def test_route_message_dispatch_multi_regex_subtasks(self):
+        """Broken dispatch_multi JSON → extract subtasks via regex."""
+        import asyncio
+        async def _test():
+            session = ClaudeSession(session_id=None)
+            broken = '{"action": "dispatch_multi", "description": "执行"多步"任务", "subtasks": ["分析代码", "运行测试", "生成报告"]}'
+            data = {"result": broken}
+            stdout = json.dumps(data).encode()
+            mock_proc = AsyncMock()
+            mock_proc.communicate = AsyncMock(return_value=(stdout, b""))
+            mock_proc.returncode = 0
+            with patch("supervisor.claude_session.asyncio.create_subprocess_exec", return_value=mock_proc):
+                with patch("supervisor.claude_session.asyncio.wait_for", return_value=(stdout, b"")):
+                    result = await session.route_message("多任务", "system", "user")
+                    assert result["action"] == "dispatch_multi"
+                    assert "分析代码" in result["subtasks"]
+                    assert "运行测试" in result["subtasks"]
         asyncio.run(_test())
 
     def test_route_message_empty_result(self):
@@ -514,7 +583,7 @@ class TestClaudeSession:
 
             with patch("supervisor.claude_session.asyncio.create_subprocess_exec", return_value=mock_proc):
                 with patch("supervisor.claude_session.asyncio.wait_for", return_value=(stdout, b"")):
-                    result = await session.route_message("test", "prompt")
+                    result = await session.route_message("test", "system", "user")
                     assert result["action"] == "dispatch"
 
         asyncio.run(_test())

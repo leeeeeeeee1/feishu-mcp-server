@@ -33,6 +33,10 @@ logger = logging.getLogger(__name__)
 _seen_messages: dict[str, float] = {}
 _DEDUP_TTL = 60
 
+# Discard messages older than this (seconds) — prevents processing
+# backlogged messages after WebSocket reconnect
+_STALE_MSG_TTL = 300  # 5 minutes
+
 
 def _dedup_check(message_id: str) -> bool:
     """Return True if this message was already seen (duplicate)."""
@@ -77,7 +81,8 @@ class FeishuGateway:
     def set_message_handler(self, handler: Callable):
         """Set the callback for incoming messages.
 
-        handler(sender_id: str, message_id: str, chat_id: str, msg_type: str, content: str, raw_event)
+        handler(sender_id: str, message_id: str, chat_id: str, msg_type: str,
+                content: str, raw_event, parent_id: str, root_id: str)
         """
         self._on_message = handler
 
@@ -98,6 +103,17 @@ class FeishuGateway:
         if sender and sender.sender_type == "app":
             return
 
+        # Skip stale messages (e.g. backlog after WebSocket reconnect)
+        create_time_ms = getattr(msg, "create_time", None)
+        if isinstance(create_time_ms, str) and create_time_ms.isdigit():
+            age_s = time.time() - int(create_time_ms) / 1000
+            if age_s > _STALE_MSG_TTL:
+                logger.info(
+                    "[MSG] Skipping stale message %s (age=%.0fs, threshold=%ds)",
+                    msg.message_id, age_s, _STALE_MSG_TTL,
+                )
+                return
+
         # Dedup
         if _dedup_check(msg.message_id):
             logger.debug("Dedup: skipping %s", msg.message_id)
@@ -108,7 +124,15 @@ class FeishuGateway:
         msg_type = msg.message_type or "text"
         raw_content = msg.content or ""
 
-        logger.info("[MSG] from=%s type=%s chat=%s", sender_id, msg_type, chat_id)
+        # Extract parent_id/root_id for reply detection
+        parent_id = getattr(msg, "parent_id", None) or ""
+        root_id = getattr(msg, "root_id", None) or ""
+
+        create_time = getattr(msg, "create_time", None) or ""
+        logger.info(
+            "[MSG] from=%s type=%s chat=%s parent=%s create_time=%s",
+            sender_id, msg_type, chat_id, parent_id or "(none)", create_time or "(unknown)",
+        )
 
         # Extract text content
         text = raw_content
@@ -129,6 +153,8 @@ class FeishuGateway:
                 msg_type=msg_type,
                 content=text,
                 raw_event=data,
+                parent_id=parent_id,
+                root_id=root_id,
             )
 
     def _handle_message_read(self, data: P2ImMessageMessageReadV1):

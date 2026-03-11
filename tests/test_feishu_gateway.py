@@ -128,6 +128,86 @@ class TestMessageHandling:
         assert received["content"] == "hello Claude"
 
 
+class TestParentIdExtraction:
+    """Test that parent_id and root_id are extracted from reply messages."""
+
+    def _make_gateway(self):
+        return FeishuGateway(app_id="test-id", app_secret="test-secret")
+
+    def test_reply_message_passes_parent_id(self):
+        """When a message has parent_id, it should be passed to the handler."""
+        gw = self._make_gateway()
+        received = {}
+
+        def handler(**kwargs):
+            received.update(kwargs)
+
+        gw.set_message_handler(handler)
+
+        data = MagicMock()
+        data.event.sender.sender_type = "user"
+        data.event.sender.sender_id.open_id = "u1"
+        data.event.message.message_id = "msg-reply-1"
+        data.event.message.chat_id = "chat-1"
+        data.event.message.message_type = "text"
+        data.event.message.content = json.dumps({"text": "这个结果对吗"})
+        data.event.message.parent_id = "msg-parent-123"
+        data.event.message.root_id = "msg-root-456"
+
+        gw._handle_message(data)
+        assert received["parent_id"] == "msg-parent-123"
+        assert received["root_id"] == "msg-root-456"
+
+    def test_normal_message_passes_empty_parent_id(self):
+        """Non-reply messages should have empty parent_id/root_id."""
+        gw = self._make_gateway()
+        received = {}
+
+        def handler(**kwargs):
+            received.update(kwargs)
+
+        gw.set_message_handler(handler)
+
+        data = MagicMock()
+        data.event.sender.sender_type = "user"
+        data.event.sender.sender_id.open_id = "u1"
+        data.event.message.message_id = "msg-normal-1"
+        data.event.message.chat_id = "chat-1"
+        data.event.message.message_type = "text"
+        data.event.message.content = json.dumps({"text": "你好"})
+        data.event.message.parent_id = None
+        data.event.message.root_id = None
+
+        gw._handle_message(data)
+        assert received["parent_id"] == ""
+        assert received["root_id"] == ""
+
+    def test_missing_parent_id_attribute_defaults_empty(self):
+        """If parent_id attribute doesn't exist on message, default to empty."""
+        gw = self._make_gateway()
+        received = {}
+
+        def handler(**kwargs):
+            received.update(kwargs)
+
+        gw.set_message_handler(handler)
+
+        data = MagicMock()
+        data.event.sender.sender_type = "user"
+        data.event.sender.sender_id.open_id = "u1"
+        data.event.message.message_id = "msg-no-attr"
+        data.event.message.chat_id = "chat-1"
+        data.event.message.message_type = "text"
+        data.event.message.content = json.dumps({"text": "hello"})
+        # Simulate missing attribute
+        del data.event.message.parent_id
+        del data.event.message.root_id
+
+        gw._handle_message(data)
+        assert received["parent_id"] == ""
+        assert received["root_id"] == ""
+
+
 class TestSending:
     def _make_gateway(self):
         gw = FeishuGateway(app_id="test-id", app_secret="test-secret")

@@ -51,15 +51,24 @@ Decide the action for this user message:
 - User is asking about, commenting on, or following up on a previous task result
 - Include the task_id field matching the task being referenced
 
+### action = "close" (close a completed task)
+- User expresses intent to close/finish/dismiss a task (关闭, 结束, 不用了, 完事了, 可以关了, 关掉, 关了, close, done with it)
+- Patterns: "XXX关闭了", "XXX那个关了", "把XXX关掉", "XXX可以关了", "XXX不用了", "关闭XXX"
+- IMPORTANT: If the user message contains a close keyword (关闭/关了/关掉/结束/不用了/完事了) referring to a task, use "close" NOT "follow_up"
+- ONLY available when there are tasks in awaiting_closure state (listed below)
+- Must match to a specific awaiting_closure task via task_id
+- If only one task is awaiting closure → auto-match that task
+- If multiple tasks → match based on context (recent conversation, user reference, task description keywords)
+- Return {"action": "close", "task_id": "<8-char id>"}
+
 ## Critical Rules
 1. "总结/分析 + specific project/codebase" → dispatch (needs file access)
 2. "总结/分析 + general concept" → reply (knowledge-based)
 3. When in doubt, prefer dispatch over reply (better to execute than answer shallowly)
 4. For reply: generate a complete, helpful response — not a placeholder
 5. Keep reply text under 2000 characters
-6. If the user says "关闭/close" a task → reply (tell them to use /close <id>)
-7. If the user is clearly commenting on or asking about a recent task result → follow_up
-8. Task status/progress queries (任务完了吗, 进展如何, 到哪了, 什么状态):
+6. If the user is clearly commenting on or asking about a recent task result → follow_up
+7. Task status/progress queries (任务完了吗, 进展如何, 到哪了, 什么状态):
    - If task info is provided in "Currently active tasks" or "Tasks awaiting closure" above → reply using ONLY that data, do NOT fabricate or guess any information
    - If no task info is provided above → reply saying "当前没有任务" (no tasks)
    - NEVER invent task states, steps, or results that are not explicitly listed above"""
@@ -105,46 +114,64 @@ User: "这个结果对吗" (when task [aabb1122] "分析代码" is awaiting clos
 → {"action": "follow_up", "task_id": "aabb1122", "text": "这个结果对吗"}
 
 User: "关闭这个任务" (when task [aabb1122] is awaiting closure)
-→ {"action": "reply", "text": "请使用 /close aabb1122 来关闭任务。"}"""
+→ {"action": "close", "task_id": "aabb1122"}
 
-# ── Prompt Template ──
+User: "好的不用了" (when task [aabb1122] is awaiting closure)
+→ {"action": "close", "task_id": "aabb1122"}
 
-_ROUTE_PROMPT = """{identity}
+User: "可以关了" (when tasks [aabb1122] and [ccdd3344] are awaiting closure, user just discussed aabb1122)
+→ {"action": "close", "task_id": "aabb1122"}
+
+User: "检查系统日志那个关闭了" (when tasks [aabb1122] "分析代码" and [ccdd3344] "检查系统日志" are awaiting closure)
+→ {"action": "close", "task_id": "ccdd3344"}
+
+User: "分析代码那个结束吧" (when task [aabb1122] "分析代码" is awaiting closure)
+→ {"action": "close", "task_id": "aabb1122"}"""
+
+# ── Prompt Templates ──
+
+# System prompt: stable part (identity + rules + examples) — cached by API/CLI
+_ROUTE_SYSTEM = """{identity}
 
 {rules}
 
 {examples}
-{awaiting_context}
-## Your Task
-
-Classify this user message and respond accordingly.
-
-User message:
-<user_message>
-{user_message}
-</user_message>
 
 Reply with ONLY a JSON object (no markdown, no code blocks):
 - If replying directly: {{"action": "reply", "text": "your response here"}}
 - If dispatching single task: {{"action": "dispatch", "description": "short task description"}}
 - If decomposing into sub-tasks: {{"action": "dispatch_multi", "description": "overall description", "subtasks": ["sub1", "sub2", ...]}}
-- If following up on an existing task: {{"action": "follow_up", "task_id": "<8-char id>", "text": "the follow-up question"}}"""
+- If following up on an existing task: {{"action": "follow_up", "task_id": "<8-char id>", "text": "the follow-up question"}}
+- If closing a completed task: {{"action": "close", "task_id": "<8-char id>"}}"""
+
+# User prompt: dynamic part (tasks + history + message) — changes per request
+_ROUTE_USER = """{awaiting_context}{history_context}Classify this user message and respond with a JSON object.
+
+<user_message>
+{user_message}
+</user_message>"""
+
+# Combined single-prompt (for CLI fallback that doesn't support separate system prompt)
+_ROUTE_COMBINED = """{system}
+{user}"""
 
 
-def build_route_prompt(
+def build_route_system_prompt() -> str:
+    """Build the stable system prompt for routing (cacheable)."""
+    return _ROUTE_SYSTEM.format(
+        identity=SUPERVISOR_IDENTITY,
+        rules=ROUTING_RULES,
+        examples=ROUTING_EXAMPLES,
+    )
+
+
+def build_route_user_prompt(
     user_message: str,
     awaiting_tasks: list[dict] | None = None,
     active_tasks: list[dict] | None = None,
+    conversation_history: str = "",
 ) -> str:
-    """Build the unified route + respond prompt for sonnet.
-
-    Args:
-        user_message: The user's message text.
-        awaiting_tasks: Optional list of dicts with keys "id" and "description"
-                       for tasks currently in awaiting_closure state.
-        active_tasks: Optional list of dicts with keys "id", "status", "description"
-                     for tasks currently running or pending.
-    """
+    """Build the dynamic user prompt for routing (changes per request)."""
     task_sections = []
 
     if active_tasks:
@@ -170,10 +197,32 @@ def build_route_prompt(
 
     awaiting_context = "\n".join(task_sections) + "\n" if task_sections else ""
 
-    return _ROUTE_PROMPT.format(
-        identity=SUPERVISOR_IDENTITY,
-        rules=ROUTING_RULES,
-        examples=ROUTING_EXAMPLES,
+    history_context = ""
+    if conversation_history:
+        history_context = f"## Recent conversation history\n{conversation_history}\n\n"
+
+    return _ROUTE_USER.format(
         user_message=user_message,
         awaiting_context=awaiting_context,
+        history_context=history_context,
     )
+
+
+def build_route_prompt(
+    user_message: str,
+    awaiting_tasks: list[dict] | None = None,
+    active_tasks: list[dict] | None = None,
+    conversation_history: str = "",
+) -> str:
+    """Build the combined route prompt (for CLI fallback).
+
+    For API usage, use build_route_system_prompt() + build_route_user_prompt() separately.
+    """
+    system = build_route_system_prompt()
+    user = build_route_user_prompt(
+        user_message=user_message,
+        awaiting_tasks=awaiting_tasks,
+        active_tasks=active_tasks,
+        conversation_history=conversation_history,
+    )
+    return _ROUTE_COMBINED.format(system=system, user=user)

@@ -20,12 +20,18 @@ export PYTHONPATH="/workspace/feishu-mcp-server/src"
 export NO_PROXY="open.feishu.cn,msg-frontier.feishu.cn,internal-api-lark-api.feishu.cn"
 export no_proxy="$NO_PROXY"
 
-# Kill existing instance
+# Kill existing instances (both daemon wrapper and any orphan python processes)
 if [ -f "$PIDFILE" ]; then
     old_pid=$(cat "$PIDFILE")
     kill "$old_pid" 2>/dev/null && echo "Killed old daemon (PID $old_pid)"
-    sleep 1
 fi
+if [ -f "$CHILD_PIDFILE" ]; then
+    old_child=$(cat "$CHILD_PIDFILE")
+    kill "$old_child" 2>/dev/null && echo "Killed old child (PID $old_child)"
+fi
+# Kill any orphan supervisor.main processes
+pkill -f "python3 -m supervisor.main" 2>/dev/null && echo "Killed orphan supervisor processes"
+sleep 1
 
 echo $$ > "$PIDFILE"
 

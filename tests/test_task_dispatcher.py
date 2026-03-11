@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock, patch, MagicMock
 from supervisor.task_dispatcher import (
     Task,
     _looks_like_needs_input,
+    _looks_like_close,
+    _contains_close_intent,
     _build_cmd,
     _reset,
     dispatch,
@@ -60,7 +62,7 @@ def _make_proc_mock(stdout_data=b"", stderr_data=b"", returncode=0):
     return proc
 
 
-def _json_result(result_text="OK", session_id="sess-1"):
+def _json_result(result_text="OK", session_id="a1b2c3d4-e5f6-7890-abcd-ef1234567890"):
     """Build a stream-json result line (used by streaming _run_claude)."""
     return json.dumps({
         "type": "result",
@@ -91,6 +93,136 @@ class TestInputHeuristic:
 
     def test_looks_like_input_confirm(self):
         assert _looks_like_needs_input("Please confirm this action?") is True
+
+
+# ── Close intent heuristic tests ──
+
+
+class TestCloseHeuristic:
+    def test_chinese_acknowledgements(self):
+        assert _looks_like_close("好的") is True
+        assert _looks_like_close("收到") is True
+        assert _looks_like_close("可以了") is True
+        assert _looks_like_close("没问题") is True
+        assert _looks_like_close("不用了") is True
+        assert _looks_like_close("就这样") is True
+        assert _looks_like_close("完成") is True
+
+    def test_english_acknowledgements(self):
+        assert _looks_like_close("ok") is True
+        assert _looks_like_close("OK") is True
+        assert _looks_like_close("thanks") is True
+        assert _looks_like_close("done") is True
+        assert _looks_like_close("lgtm") is True
+
+    def test_with_trailing_punctuation(self):
+        assert _looks_like_close("好的。") is True
+        assert _looks_like_close("收到！") is True
+        assert _looks_like_close("ok!") is True
+        assert _looks_like_close("谢谢~") is True
+
+    def test_with_emoji(self):
+        assert _looks_like_close("👍") is True
+
+    def test_long_message_not_close(self):
+        assert _looks_like_close("好的，但是我还有个问题想问一下关于这个接口的实现") is False
+
+    def test_question_not_close(self):
+        assert _looks_like_close("好的，还有别的问题吗？") is False
+
+    def test_actual_follow_up_not_close(self):
+        assert _looks_like_close("帮我再加个鉴权") is False
+        assert _looks_like_close("这个接口还需要改一下返回格式") is False
+
+    def test_empty_string(self):
+        assert _looks_like_close("") is False
+
+    def test_whitespace_handling(self):
+        assert _looks_like_close("  好的  ") is True
+        assert _looks_like_close("  ok  ") is True
+
+    def test_negation_not_close(self):
+        assert _looks_like_close("not ok") is False
+
+    def test_status_report_not_close(self):
+        assert _looks_like_close("I am done") is False
+        assert _looks_like_close("all done") is False
+
+    def test_embedded_phrase_not_close(self):
+        assert _looks_like_close("ok but") is False
+        assert _looks_like_close("lgtm bro") is False
+
+
+class TestContainsCloseIntent:
+    """Tests for _contains_close_intent — detects close keywords in longer text."""
+
+    def test_xxx_closed(self):
+        assert _contains_close_intent("检查系统日志那个关闭了") is True
+
+    def test_xxx_guan_le(self):
+        assert _contains_close_intent("分析代码那个关了") is True
+
+    def test_ba_xxx_guan_diao(self):
+        assert _contains_close_intent("把那个任务关掉") is True
+
+    def test_jieshu(self):
+        assert _contains_close_intent("分析代码那个结束吧") is True
+
+    def test_buyongle(self):
+        assert _contains_close_intent("那个不用了") is True
+
+    def test_wanshile(self):
+        assert _contains_close_intent("完事了") is True
+
+    def test_keyi_guan_le(self):
+        assert _contains_close_intent("可以关了") is True
+
+    def test_english_close(self):
+        assert _contains_close_intent("please close that task") is True
+
+    def test_english_done_with_it(self):
+        assert _contains_close_intent("I'm done with it") is True
+
+    def test_guanbi_ba(self):
+        assert _contains_close_intent("那个任务关闭吧") is True
+
+    def test_guanbi_zhege(self):
+        assert _contains_close_intent("关闭这个") is True
+
+    def test_jieshu_le(self):
+        assert _contains_close_intent("任务结束了") is True
+
+    def test_jieshu_renwu(self):
+        assert _contains_close_intent("结束任务") is True
+
+    def test_false_positive_close_connection(self):
+        assert _contains_close_intent("关闭连接后重试") is False
+
+    def test_false_positive_close_port(self):
+        assert _contains_close_intent("关闭端口") is False
+
+    def test_false_positive_close_service(self):
+        assert _contains_close_intent("关闭服务") is False
+
+    def test_false_positive_close_process(self):
+        assert _contains_close_intent("关掉进程") is False
+
+    def test_false_positive_process_guan_diao(self):
+        """Noun-before-verb: '进程关掉' should NOT be close intent."""
+        assert _contains_close_intent("帮我把nginx进程关掉") is False
+
+    def test_false_positive_bare_jieshu(self):
+        """Bare '结束' without task suffix should NOT match."""
+        assert _contains_close_intent("死循环不会结束") is False
+
+    def test_false_positive_jieshu_process(self):
+        assert _contains_close_intent("结束进程") is False
+
+    def test_no_close_intent(self):
+        assert _contains_close_intent("帮我再看一下这个结果") is False
+
+    def test_empty_string(self):
+        assert _contains_close_intent("") is False
 
 
 # ── Build command tests ──
@@ -250,13 +382,19 @@ class TestDaemons:
         asyncio.run(_test())
 
     def test_daemon_auto_restart(self):
-        """A daemon that fails should auto-restart up to max_retries."""
+        """A daemon that fails should auto-restart up to max_retries.
+
+        Each _run_claude attempt triggers streaming then non-streaming fallback,
+        so 2 subprocess calls per _run_claude failure.
+        """
         call_count = 0
 
         async def mock_exec(*args, **kwargs):
             nonlocal call_count
             call_count += 1
-            if call_count < 3:
+            # 2 failures × 2 modes (streaming + non-streaming) = 4 calls,
+            # then 5th call (streaming retry) succeeds
+            if call_count < 5:
                 return _make_proc_mock(stderr_data=b"error", returncode=1)
             return _make_proc_mock(_json_result("finally worked"))
 
@@ -265,7 +403,7 @@ class TestDaemons:
                        side_effect=mock_exec):
                 task = await dispatch("flaky daemon", task_type="daemon")
                 await asyncio.sleep(0.3)
-                # After 2 failures and 1 success it should be awaiting_closure
+                # After 2 full failures and 1 success it should be awaiting_closure
                 assert task.status == "awaiting_closure"
                 assert task.retries == 2
 
@@ -600,14 +738,14 @@ class TestFollowUpAsync:
         async def _test():
             # Create a task that finishes normally
             with patch("supervisor.task_dispatcher.asyncio.create_subprocess_exec",
-                       return_value=_make_proc_mock(_json_result("Initial result", "sess-abc"))):
+                       return_value=_make_proc_mock(_json_result("Initial result", "550e8400-e29b-41d4-a716-446655440000"))):
                 task = await dispatch("work")
                 await asyncio.sleep(0.1)
                 assert task.status == "awaiting_closure"
-                assert task.session_id == "sess-abc"
+                assert task.session_id == "550e8400-e29b-41d4-a716-446655440000"
 
             # Follow up on it
-            follow_result = _json_result("Follow-up answer", "sess-abc")
+            follow_result = _json_result("Follow-up answer", "550e8400-e29b-41d4-a716-446655440000")
             with patch("supervisor.task_dispatcher.asyncio.create_subprocess_exec",
                        return_value=_make_proc_mock(follow_result)):
                 result = await follow_up_async(task.id, "Tell me more")
@@ -630,4 +768,147 @@ class TestFollowUpAsync:
                 except ValueError as e:
                     assert "not awaiting closure" in str(e)
 
+        asyncio.run(_test())
+
+
+class TestLoadTasksPersistence:
+    """Test _load_tasks handles edge cases: None floats, orphaned .tmp files."""
+
+    def setup_method(self):
+        _reset()
+
+    def test_load_tasks_null_float_fields(self, tmp_path):
+        """_load_tasks should not crash when float fields are None in JSON."""
+        from supervisor.task_dispatcher import _load_tasks, _tasks, _TASKS_FILE
+        import supervisor.task_dispatcher as td
+
+        tasks_file = tmp_path / "tasks.json"
+        data = {
+            "task-123": {
+                "id": "task-123",
+                "prompt": "test",
+                "task_type": "oneshot",
+                "status": "awaiting_closure",
+                "created_at": 1000.0,
+                "started_at": None,
+                "finished_at": None,
+            }
+        }
+        tasks_file.write_text(json.dumps(data))
+
+        # Temporarily swap the file path
+        original = td._TASKS_FILE
+        td._TASKS_FILE = tasks_file
+        _tasks.clear()
+        try:
+            _load_tasks()
+            assert "task-123" in _tasks
+            t = _tasks["task-123"]
+            assert t.started_at == 0.0
+            assert t.finished_at == 0.0
+        finally:
+            td._TASKS_FILE = original
+            _tasks.clear()
+
+    def test_load_tasks_orphaned_tmp_recovery(self, tmp_path):
+        """_load_tasks should recover from orphaned .tmp file."""
+        from supervisor.task_dispatcher import _load_tasks, _tasks
+        import supervisor.task_dispatcher as td
+
+        tasks_file = tmp_path / "tasks.json"
+        tmp_file = tmp_path / "tasks.tmp"
+        data = {
+            "task-456": {
+                "id": "task-456",
+                "prompt": "test",
+                "task_type": "oneshot",
+                "status": "completed",
+                "created_at": 1000.0,
+                "started_at": 1001.0,
+                "finished_at": time.time(),
+            }
+        }
+        tmp_file.write_text(json.dumps(data))
+
+        original = td._TASKS_FILE
+        td._TASKS_FILE = tasks_file
+        _tasks.clear()
+        try:
+            _load_tasks()
+            # tmp should have been renamed to tasks_file
+            assert tasks_file.exists()
+            assert "task-456" in _tasks
+        finally:
+            td._TASKS_FILE = original
+            _tasks.clear()
+
+    def test_load_tasks_running_marked_failed(self, tmp_path):
+        """Tasks that were running at crash time should be marked failed."""
+        from supervisor.task_dispatcher import _load_tasks, _tasks
+        import supervisor.task_dispatcher as td
+
+        tasks_file = tmp_path / "tasks.json"
+        data = {
+            "task-789": {
+                "id": "task-789",
+                "prompt": "test",
+                "task_type": "oneshot",
+                "status": "running",
+                "created_at": 1000.0,
+                "started_at": 1001.0,
+                "finished_at": 0.0,
+            }
+        }
+        tasks_file.write_text(json.dumps(data))
+
+        original = td._TASKS_FILE
+        td._TASKS_FILE = tasks_file
+        _tasks.clear()
+        try:
+            _load_tasks()
+            assert _tasks["task-789"].status == "failed"
+            assert "restarted" in _tasks["task-789"].error.lower()
+        finally:
+            td._TASKS_FILE = original
+            _tasks.clear()
+
+
+class TestDispatchWithDescription:
+    """Test that dispatch() accepts and uses an explicit description."""
+
+    def setup_method(self):
+        _reset()
+
+    def test_explicit_description_used(self):
+        async def _test():
+            with patch("supervisor.task_dispatcher.asyncio.create_subprocess_exec",
+                       return_value=_make_proc_mock(_json_result("OK"))):
+                task = await dispatch(
+                    "You are a worker agent...\nTask: Analyze code",
+                    description="Analyze code",
+                )
+                assert task.description == "Analyze code"
+                await asyncio.sleep(0.1)
+        asyncio.run(_test())
+
+    def test_empty_description_falls_back_to_auto(self):
+        async def _test():
+            with patch("supervisor.task_dispatcher.asyncio.create_subprocess_exec",
+                       return_value=_make_proc_mock(_json_result("OK"))):
+                task = await dispatch("Simple request here")
+                assert task.description == "Simple request here"
+                await asyncio.sleep(0.1)
+        asyncio.run(_test())
+
+    def test_explicit_description_avoids_worker_preamble(self):
+        async def _test():
+            with patch("supervisor.task_dispatcher.asyncio.create_subprocess_exec",
+                       return_value=_make_proc_mock(_json_result("OK"))):
+                task = await dispatch(
+                    "You are a worker agent in a container.\nTask: Build X",
+                    description="Build X",
+                )
+                assert task.description == "Build X"
+                assert "worker agent" not in task.description
+                await asyncio.sleep(0.1)
         asyncio.run(_test())
