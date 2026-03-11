@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 SUPERVISOR_MAX_WORKERS = int(os.environ.get("SUPERVISOR_MAX_WORKERS", "3"))
 SUPERVISOR_MAX_DAEMONS = int(os.environ.get("SUPERVISOR_MAX_DAEMONS", "2"))
 
+# Checkpoint directory for crash recovery
+_CHECKPOINT_DIR = Path(os.environ.get("SUPERVISOR_CHECKPOINT_DIR", "/tmp/supervisor-checkpoints"))
+
 # asyncio StreamReader default limit is 64KB — too small for claude stream-json
 # which can emit single lines >64KB (e.g. large code blocks). 10MB is safe.
 _STREAM_LIMIT = 10 * 1024 * 1024  # 10 MB
@@ -159,7 +162,7 @@ class Task:
     id: str
     prompt: str
     task_type: str  # "oneshot" or "daemon"
-    status: str  # pending, running, waiting_for_input, done, awaiting_closure, follow_up, review, learning, completed, failed, cancelled
+    status: str  # pending, running, waiting_for_input, done, awaiting_closure, follow_up, review, learning, completed, failed, interrupted, cancelled
     description: str = ""  # short human-readable summary (auto-generated from prompt)
     current_step: str = ""  # what the task is doing right now
     steps_completed: list = field(default_factory=list)  # list of completed step descriptions
@@ -206,8 +209,72 @@ def _save_tasks() -> None:
         logger.error("Failed to save tasks: %s", e)
 
 
+_SAFE_ID_RE = _re.compile(r'^[0-9a-f\-]{8,36}$', _re.IGNORECASE)
+
+
+def _checkpoint_path(task_id: str) -> Path:
+    """Build a safe checkpoint file path, rejecting path-traversal IDs."""
+    if not _SAFE_ID_RE.match(task_id):
+        raise ValueError(f"Invalid task_id for checkpoint: {task_id!r}")
+    return _CHECKPOINT_DIR / f"{task_id}.json"
+
+
+def _save_checkpoint(task: "Task") -> None:
+    """Save a checkpoint for a running task (crash recovery)."""
+    try:
+        _CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+        data = {
+            "task_id": task.id,
+            "timestamp": time.time(),
+            "steps_completed": list(task.steps_completed),
+            "current_step": task.current_step,
+            "partial_result": task.result or "",
+            "session_id": task.session_id or "",
+        }
+        ckpt_file = _checkpoint_path(task.id)
+        tmp = ckpt_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False))
+        tmp.rename(ckpt_file)
+    except Exception as e:
+        logger.warning("Failed to save checkpoint for %s: %s", task.id[:8], e)
+
+
+def _load_checkpoint(task_id: str) -> dict | None:
+    """Load checkpoint data for a task. Returns None if not found."""
+    try:
+        ckpt_file = _checkpoint_path(task_id)
+    except ValueError:
+        logger.warning("Skipping checkpoint load for invalid task_id: %s", task_id[:8])
+        return None
+    if not ckpt_file.exists():
+        return None
+    try:
+        return json.loads(ckpt_file.read_text())
+    except Exception as e:
+        logger.warning("Failed to load checkpoint for %s: %s", task_id[:8], e)
+        return None
+
+
+def _clear_checkpoint(task_id: str) -> None:
+    """Remove checkpoint file after task completes normally."""
+    try:
+        ckpt_file = _checkpoint_path(task_id)
+        ckpt_file.unlink(missing_ok=True)
+    except ValueError:
+        pass  # invalid ID — no checkpoint to clear
+    except Exception as e:
+        logger.warning("Failed to clear checkpoint for %s: %s", task_id[:8], e)
+
+
 def _load_tasks() -> None:
-    """Load tasks from disk on startup."""
+    """Load tasks from disk on startup.
+
+    Recovery strategy for tasks that were active when supervisor crashed:
+    - pending (never started): keep as pending — can be re-dispatched
+    - running with progress: mark as interrupted — resumable via recover_task()
+    - running without progress: mark as interrupted — retryable
+    Checkpoint data (if available) is merged to preserve progress information.
+    """
     # Clean up orphaned .tmp file from interrupted save
     tmp = _TASKS_FILE.with_suffix(".tmp")
     if tmp.exists() and not _TASKS_FILE.exists():
@@ -225,6 +292,7 @@ def _load_tasks() -> None:
         return
     try:
         data = json.loads(_TASKS_FILE.read_text())
+        interrupted_count = 0
         for tid, d in data.items():
             # Skip completed/cancelled tasks older than 24h
             if d.get("status") in ("completed", "cancelled"):
@@ -237,13 +305,45 @@ def _load_tasks() -> None:
                 if float_field in filtered and filtered[float_field] is None:
                     filtered[float_field] = 0.0
             task = Task(**filtered)
-            # Tasks that were running when we crashed → mark as failed
-            if task.status in ("running", "pending"):
-                task.status = "failed"
+
+            # Smart recovery for tasks active during crash
+            if task.status == "pending":
+                # Never started — keep as pending (safe to re-queue)
+                pass
+            elif task.status == "running":
+                # Was executing — mark as interrupted, merge checkpoint data
+                checkpoint = _load_checkpoint(tid)
+                if checkpoint:
+                    # Merge checkpoint: prefer checkpoint data (more recent)
+                    ckpt_steps = checkpoint.get("steps_completed", [])
+                    if len(ckpt_steps) > len(task.steps_completed):
+                        task.steps_completed = ckpt_steps
+                    task.current_step = checkpoint.get("current_step", task.current_step)
+                    partial = checkpoint.get("partial_result", "")
+                    if partial and not task.result:
+                        task.result = partial
+                    ckpt_sid = checkpoint.get("session_id", "")
+                    if ckpt_sid and not task.session_id:
+                        task.session_id = ckpt_sid
+
+                task.status = "interrupted"
                 task.error = "Supervisor restarted while task was in progress"
                 task.finished_at = time.time()
+                interrupted_count += 1
+                logger.warning(
+                    "Task %s: running → interrupted (session=%s, steps=%d)",
+                    tid[:8], bool(task.session_id), len(task.steps_completed),
+                )
+
             _tasks[tid] = task
-        logger.info("Loaded %d tasks from disk", len(_tasks))
+
+        if interrupted_count:
+            logger.info(
+                "Loaded %d tasks (%d interrupted, recoverable via /recover)",
+                len(_tasks), interrupted_count,
+            )
+        else:
+            logger.info("Loaded %d tasks from disk", len(_tasks))
     except Exception as e:
         logger.error("Failed to load tasks: %s", e)
 
@@ -326,6 +426,7 @@ async def _run_claude_streaming(task: Task, env: dict) -> bool:
                         step_desc = f"{tool_name}: {tool_input}"
                         task.current_step = step_desc
                         task.steps_completed.append(step_desc)
+                        _save_checkpoint(task)
                     elif block.get("type") == "text":
                         text = block.get("text", "")
                         if text:
@@ -435,6 +536,7 @@ async def _run_claude(task: Task) -> None:
 
     task.finished_at = time.time()
     task.current_step = "Finished"
+    _clear_checkpoint(task.id)
 
     # Check if Claude is asking for input
     if _looks_like_needs_input(task.result):
@@ -861,6 +963,84 @@ def get_review_pending() -> list[Task]:
     return [t for t in _tasks.values() if t.status in ("review", "waiting_for_input")]
 
 
+def list_interrupted() -> list[Task]:
+    """Return tasks in interrupted status (recoverable after restart)."""
+    return [t for t in _tasks.values() if t.status == "interrupted"]
+
+
+async def recover_task(
+    task_id: str,
+    mode: str = "resume",
+    on_complete: Optional[Callable] = None,
+) -> Optional[Task]:
+    """Recover an interrupted task.
+
+    Args:
+        task_id: The interrupted task ID.
+        mode: Recovery strategy:
+            - "resume": Re-dispatch using existing session_id (continues where it left off).
+            - "retry": Re-dispatch from scratch (fresh session).
+            - "dismiss": Mark as failed and do not retry.
+        on_complete: Optional callback for the new task.
+
+    Returns:
+        The newly dispatched Task (for resume/retry), or None (for dismiss).
+
+    Raises:
+        ValueError: If task not found or not in interrupted status.
+    """
+    task = _tasks.get(task_id)
+    if task is None:
+        raise ValueError(f"Unknown task: {task_id}")
+    if task.status != "interrupted":
+        raise ValueError(
+            f"Task {task_id[:8]} is not interrupted (status={task.status})"
+        )
+
+    if mode == "dismiss":
+        task.status = "failed"
+        task.error = "Dismissed by user after restart interruption"
+        task.finished_at = time.time()
+        _save_tasks()
+        _clear_checkpoint(task_id)
+        logger.info("Task %s: interrupted → dismissed (failed)", task_id[:8])
+        return None
+
+    # Mark original as completed (superseded by recovery task)
+    task.status = "completed"
+    task.finished_at = time.time()
+    _save_tasks()
+    _clear_checkpoint(task_id)
+
+    # Build the recovery prompt
+    if mode == "resume" and task.session_id:
+        # Resume: use existing session, ask to continue
+        new_task = await dispatch(
+            prompt=f"Continue the previous task. Context: {task.prompt[:200]}",
+            cwd=task.cwd,
+            task_type=task.task_type,
+            on_complete=on_complete,
+            description=f"[resumed] {task.description}",
+        )
+        # Inject the session_id so it resumes the same Claude session
+        new_task.session_id = task.session_id
+    else:
+        # Retry: fresh start
+        new_task = await dispatch(
+            prompt=task.prompt,
+            cwd=task.cwd,
+            task_type=task.task_type,
+            on_complete=on_complete,
+            description=f"[retried] {task.description}",
+        )
+
+    logger.info(
+        "Task %s: recovered via %s → new task %s",
+        task_id[:8], mode, new_task.id[:8],
+    )
+    return new_task
+
+
 def stop_daemon(task_id: str) -> str:
     """Stop a running daemon task.
 
@@ -919,6 +1099,7 @@ def _status_icon(status: str) -> str:
         "learning": "LEARNING",
         "completed": "COMPLETED",
         "failed": "FAILED",
+        "interrupted": "INTERRUPTED",
         "cancelled": "CANCELLED",
     }
     return icons.get(status, status.upper())
@@ -963,6 +1144,13 @@ def _format_task(task: Task) -> str:
         if len(last_step) > 60:
             last_step = last_step[:57] + "..."
         lines.append(f"  Progress: {step_count} steps | last: {last_step}")
+
+    # Interrupted task: show recovery info
+    if task.status == "interrupted":
+        resumable = "resumable" if task.session_id else "retryable"
+        lines.append(f"  Recovery: {resumable} (session={'yes' if task.session_id else 'no'}, steps={len(task.steps_completed)})")
+        if task.error:
+            lines.append(f"  Reason: {task.error[:100]}")
 
     # Result or error snippet for finished tasks
     if task.status in ("done", "completed", "failed"):

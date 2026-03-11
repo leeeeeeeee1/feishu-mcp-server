@@ -28,8 +28,13 @@ from supervisor.task_dispatcher import (
     get_tasks_text,
     get_daemons_text,
     get_review_pending,
+    list_interrupted,
+    recover_task,
     _set_status,
     _format_task,
+    _save_checkpoint,
+    _load_checkpoint,
+    _CHECKPOINT_DIR,
 )
 
 
@@ -932,8 +937,8 @@ class TestLoadTasksPersistence:
             td._TASKS_FILE = original
             _tasks.clear()
 
-    def test_load_tasks_running_marked_failed(self, tmp_path):
-        """Tasks that were running at crash time should be marked failed."""
+    def test_load_tasks_running_marked_interrupted(self, tmp_path):
+        """Running tasks at crash time should be marked interrupted, not failed."""
         from supervisor.task_dispatcher import _load_tasks, _tasks
         import supervisor.task_dispatcher as td
 
@@ -944,6 +949,8 @@ class TestLoadTasksPersistence:
                 "prompt": "test",
                 "task_type": "oneshot",
                 "status": "running",
+                "session_id": "550e8400-e29b-41d4-a716-446655440000",
+                "steps_completed": ["Read: file.py", "Edit: file.py"],
                 "created_at": 1000.0,
                 "started_at": 1001.0,
                 "finished_at": 0.0,
@@ -956,11 +963,337 @@ class TestLoadTasksPersistence:
         _tasks.clear()
         try:
             _load_tasks()
-            assert _tasks["task-789"].status == "failed"
+            assert _tasks["task-789"].status == "interrupted"
             assert "restarted" in _tasks["task-789"].error.lower()
         finally:
             td._TASKS_FILE = original
             _tasks.clear()
+
+    def test_load_tasks_pending_stays_pending(self, tmp_path):
+        """Pending tasks (never started) should stay pending on restart."""
+        from supervisor.task_dispatcher import _load_tasks, _tasks
+        import supervisor.task_dispatcher as td
+
+        tasks_file = tmp_path / "tasks.json"
+        data = {
+            "task-aaa": {
+                "id": "task-aaa",
+                "prompt": "queued task",
+                "task_type": "oneshot",
+                "status": "pending",
+                "created_at": 1000.0,
+                "started_at": 0.0,
+                "finished_at": 0.0,
+            }
+        }
+        tasks_file.write_text(json.dumps(data))
+
+        original = td._TASKS_FILE
+        td._TASKS_FILE = tasks_file
+        _tasks.clear()
+        try:
+            _load_tasks()
+            assert _tasks["task-aaa"].status == "pending"
+            assert _tasks["task-aaa"].error == ""
+        finally:
+            td._TASKS_FILE = original
+            _tasks.clear()
+
+    def test_load_tasks_running_with_checkpoint_result(self, tmp_path):
+        """Running task with checkpoint showing result → mark as interrupted with result preserved."""
+        from supervisor.task_dispatcher import _load_tasks, _tasks
+        import supervisor.task_dispatcher as td
+
+        tasks_file = tmp_path / "tasks.json"
+        checkpoint_dir = tmp_path / "checkpoints"
+        checkpoint_dir.mkdir()
+
+        # Write a checkpoint file for this task
+        checkpoint_data = {
+            "task_id": "task-chk",
+            "timestamp": time.time() - 10,
+            "steps_completed": ["Read: main.py", "Edit: main.py", "Bash: pytest"],
+            "current_step": "Bash: pytest",
+            "partial_result": "All 5 tests passed.",
+            "session_id": "550e8400-e29b-41d4-a716-446655440000",
+        }
+        (checkpoint_dir / "task-chk.json").write_text(json.dumps(checkpoint_data))
+
+        data = {
+            "task-chk": {
+                "id": "task-chk",
+                "prompt": "fix bug",
+                "task_type": "oneshot",
+                "status": "running",
+                "session_id": "550e8400-e29b-41d4-a716-446655440000",
+                "steps_completed": ["Read: main.py"],
+                "created_at": 1000.0,
+                "started_at": 1001.0,
+                "finished_at": 0.0,
+            }
+        }
+        tasks_file.write_text(json.dumps(data))
+
+        original_tasks = td._TASKS_FILE
+        original_ckpt = td._CHECKPOINT_DIR
+        td._TASKS_FILE = tasks_file
+        td._CHECKPOINT_DIR = checkpoint_dir
+        _tasks.clear()
+        try:
+            _load_tasks()
+            t = _tasks["task-chk"]
+            assert t.status == "interrupted"
+            # Checkpoint data should be merged into the task
+            assert len(t.steps_completed) == 3  # from checkpoint, more complete
+            assert t.result == "All 5 tests passed."
+        finally:
+            td._TASKS_FILE = original_tasks
+            td._CHECKPOINT_DIR = original_ckpt
+            _tasks.clear()
+
+
+# ── Checkpoint mechanism ──
+
+
+class TestCheckpoint:
+    """Test checkpoint save/load for crash recovery."""
+
+    def setup_method(self):
+        _reset()
+
+    def test_save_and_load_checkpoint(self, tmp_path):
+        """Checkpoint round-trip: save then load preserves data."""
+        import supervisor.task_dispatcher as td
+
+        original = td._CHECKPOINT_DIR
+        td._CHECKPOINT_DIR = tmp_path
+        try:
+            task = Task(
+                id="ckpt-001",
+                prompt="do work",
+                task_type="oneshot",
+                status="running",
+                session_id="550e8400-e29b-41d4-a716-446655440000",
+                current_step="Edit: main.py",
+                steps_completed=["Read: main.py", "Edit: main.py"],
+                result="partial output",
+            )
+            _save_checkpoint(task)
+
+            loaded = _load_checkpoint("ckpt-001")
+            assert loaded is not None
+            assert loaded["task_id"] == "ckpt-001"
+            assert loaded["session_id"] == "550e8400-e29b-41d4-a716-446655440000"
+            assert loaded["current_step"] == "Edit: main.py"
+            assert len(loaded["steps_completed"]) == 2
+            assert loaded["partial_result"] == "partial output"
+            assert loaded["timestamp"] > 0
+        finally:
+            td._CHECKPOINT_DIR = original
+
+    def test_load_nonexistent_checkpoint(self, tmp_path):
+        """Loading a non-existent checkpoint returns None."""
+        import supervisor.task_dispatcher as td
+
+        original = td._CHECKPOINT_DIR
+        td._CHECKPOINT_DIR = tmp_path
+        try:
+            assert _load_checkpoint("no-such-task") is None
+        finally:
+            td._CHECKPOINT_DIR = original
+
+    def test_checkpoint_saved_during_execution(self):
+        """Checkpoints should be saved when task steps are updated during streaming."""
+        async def _test():
+            # Build a streaming response with tool_use events that trigger checkpoints
+            events = [
+                json.dumps({
+                    "type": "assistant",
+                    "session_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "message": {"content": [{"type": "tool_use", "name": "Read", "input": {"file": "x.py"}}]},
+                }).encode(),
+                json.dumps({
+                    "type": "assistant",
+                    "message": {"content": [{"type": "tool_use", "name": "Edit", "input": {"file": "x.py"}}]},
+                }).encode(),
+                _json_result("Done editing."),
+            ]
+            stdout_data = b"\n".join(events)
+            proc = _make_proc_mock(stdout_data)
+
+            with patch("supervisor.task_dispatcher.asyncio.create_subprocess_exec",
+                       return_value=proc), \
+                 patch("supervisor.task_dispatcher._save_checkpoint") as mock_ckpt:
+                task = await dispatch("edit file")
+                await asyncio.sleep(0.1)
+                assert task.status == "awaiting_closure"
+                # _save_checkpoint should have been called at least once during streaming
+                assert mock_ckpt.call_count >= 1
+
+        asyncio.run(_test())
+
+
+# ── Interrupted task recovery ──
+
+
+class TestInterruptedTaskRecovery:
+    """Test recovery of interrupted tasks."""
+
+    def setup_method(self):
+        _reset()
+
+    def test_list_interrupted(self):
+        """list_interrupted() returns only tasks in interrupted status."""
+        import supervisor.task_dispatcher as td
+
+        td._tasks["t1"] = Task(
+            id="t1", prompt="a", task_type="oneshot", status="interrupted",
+            error="Supervisor restarted while task was in progress",
+        )
+        td._tasks["t2"] = Task(
+            id="t2", prompt="b", task_type="oneshot", status="failed",
+            error="real error",
+        )
+        td._tasks["t3"] = Task(
+            id="t3", prompt="c", task_type="oneshot", status="interrupted",
+            error="Supervisor restarted while task was in progress",
+        )
+        interrupted = list_interrupted()
+        assert len(interrupted) == 2
+        ids = {t.id for t in interrupted}
+        assert ids == {"t1", "t3"}
+
+    def test_recover_task_resume(self):
+        """recover_task with mode='resume' re-dispatches using existing session."""
+        async def _test():
+            import supervisor.task_dispatcher as td
+
+            td._tasks["int-1"] = Task(
+                id="int-1",
+                prompt="fix the bug",
+                task_type="oneshot",
+                status="interrupted",
+                session_id="550e8400-e29b-41d4-a716-446655440000",
+                cwd="/workspace",
+                error="Supervisor restarted while task was in progress",
+                steps_completed=["Read: main.py"],
+            )
+
+            result_data = _json_result("Bug fixed!", "550e8400-e29b-41d4-a716-446655440000")
+            with patch("supervisor.task_dispatcher.asyncio.create_subprocess_exec",
+                       return_value=_make_proc_mock(result_data)):
+                new_task = await recover_task("int-1", mode="resume")
+                await asyncio.sleep(0.1)
+
+                # Original task should be marked as completed (superseded)
+                assert td._tasks["int-1"].status == "completed"
+                # New task should exist and use the same session
+                assert new_task.session_id == "550e8400-e29b-41d4-a716-446655440000"
+                assert new_task.status == "awaiting_closure"
+
+        asyncio.run(_test())
+
+    def test_recover_task_retry(self):
+        """recover_task with mode='retry' creates a fresh task without session."""
+        async def _test():
+            import supervisor.task_dispatcher as td
+
+            td._tasks["int-2"] = Task(
+                id="int-2",
+                prompt="deploy service",
+                task_type="oneshot",
+                status="interrupted",
+                session_id="old-session-id-that-may-be-stale-0000",
+                cwd="/workspace",
+                error="Supervisor restarted while task was in progress",
+            )
+
+            result_data = _json_result("Deployed!", "a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+            with patch("supervisor.task_dispatcher.asyncio.create_subprocess_exec",
+                       return_value=_make_proc_mock(result_data)):
+                new_task = await recover_task("int-2", mode="retry")
+                await asyncio.sleep(0.1)
+
+                # Original task superseded
+                assert td._tasks["int-2"].status == "completed"
+                # New task should NOT use the old session (fresh start)
+                assert new_task.session_id != "old-session-id-that-may-be-stale-0000"
+
+        asyncio.run(_test())
+
+    def test_recover_task_dismiss(self):
+        """recover_task with mode='dismiss' marks the task as failed."""
+        async def _test():
+            import supervisor.task_dispatcher as td
+
+            td._tasks["int-3"] = Task(
+                id="int-3",
+                prompt="analyze logs",
+                task_type="oneshot",
+                status="interrupted",
+                error="Supervisor restarted while task was in progress",
+            )
+
+            result = await recover_task("int-3", mode="dismiss")
+            assert result is None
+            assert td._tasks["int-3"].status == "failed"
+            assert "dismissed" in td._tasks["int-3"].error.lower()
+
+        asyncio.run(_test())
+
+    def test_recover_task_wrong_status(self):
+        """recover_task on non-interrupted task raises ValueError."""
+        async def _test():
+            import supervisor.task_dispatcher as td
+
+            td._tasks["run-1"] = Task(
+                id="run-1", prompt="work", task_type="oneshot", status="running",
+            )
+            try:
+                await recover_task("run-1", mode="resume")
+                assert False, "Should have raised"
+            except ValueError as e:
+                assert "not interrupted" in str(e).lower()
+
+        asyncio.run(_test())
+
+    def test_recover_task_unknown(self):
+        """recover_task on unknown task raises ValueError."""
+        async def _test():
+            try:
+                await recover_task("nonexistent", mode="resume")
+                assert False, "Should have raised"
+            except ValueError:
+                pass
+
+        asyncio.run(_test())
+
+
+# ── Interrupted status formatting ──
+
+
+class TestInterruptedFormatting:
+    def test_format_interrupted_task(self):
+        task = Task(
+            id="12345678-1234-1234-1234-123456789abc",
+            prompt="fix bug",
+            task_type="oneshot",
+            status="interrupted",
+            error="Supervisor restarted while task was in progress",
+            steps_completed=["Read: main.py", "Edit: main.py"],
+            session_id="550e8400-e29b-41d4-a716-446655440000",
+            started_at=time.time() - 60,
+            finished_at=time.time(),
+        )
+        line = _format_task(task)
+        assert "INTERRUPTED" in line
+        assert "12345678" in line
+        # Should show it's resumable (has session_id)
+        assert "resumable" in line.lower()
+
+    def test_status_icon_interrupted(self):
+        from supervisor.task_dispatcher import _status_icon
+        assert _status_icon("interrupted") == "INTERRUPTED"
 
 
 class TestDispatchWithDescription:
