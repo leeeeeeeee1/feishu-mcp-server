@@ -799,6 +799,21 @@ def close_task(task_id: str) -> str:
     return f"Task {task_id[:8]} closed."
 
 
+def close_tasks(task_ids: list[str]) -> list[str]:
+    """Close multiple tasks at once.
+
+    Returns a list of result messages, one per task_id.
+    Errors are reported per-task without stopping the batch.
+    """
+    results: list[str] = []
+    for task_id in task_ids:
+        try:
+            results.append(close_task(task_id))
+        except ValueError as e:
+            results.append(f"Error: {e}")
+    return results
+
+
 def get_awaiting_closure() -> list[Task]:
     """Return tasks in awaiting_closure status."""
     return [t for t in _tasks.values() if t.status == "awaiting_closure"]

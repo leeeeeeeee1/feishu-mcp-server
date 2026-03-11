@@ -173,15 +173,48 @@ class Supervisor:
         return "Task dispatcher not available."
 
     def _cmd_close(self, arg: str) -> str:
-        """Close a task that is awaiting closure."""
+        """Close one or more tasks. Supports: /close <id>, /close <id1> <id2>, /close all."""
         if not arg:
-            return "Usage: /close <task_id>"
+            return "Usage: /close <id1> [id2 ...] or /close all"
         if not self._task_dispatcher:
             return "Task dispatcher not available."
-        task = self._find_task_by_prefix(arg)
-        if isinstance(task, str):
-            return task  # error message
-        return self._task_dispatcher.close_task(task.id)
+
+        if arg.strip().lower() == "all":
+            awaiting = self._task_dispatcher.get_awaiting_closure()
+            if not awaiting:
+                return "No tasks awaiting closure."
+            # Snapshot IDs; close_tasks handles per-task errors if status changes.
+            task_ids = [t.id for t in awaiting]
+            results = self._task_dispatcher.close_tasks(task_ids)
+            return "\n".join(results)
+
+        prefixes = arg.split()
+        if len(prefixes) == 1:
+            task = self._find_task_by_prefix(prefixes[0])
+            if isinstance(task, str):
+                return task
+            return self._task_dispatcher.close_task(task.id)
+
+        # Resolve all prefixes, preserving input order
+        resolved: list[tuple[str | None, str | None]] = []  # (task_id, error)
+        for prefix in prefixes:
+            task = self._find_task_by_prefix(prefix)
+            if isinstance(task, str):
+                resolved.append((None, task))
+            else:
+                resolved.append((task.id, None))
+
+        valid_ids = [tid for tid, _ in resolved if tid is not None]
+        close_results = iter(
+            self._task_dispatcher.close_tasks(valid_ids) if valid_ids else []
+        )
+        output: list[str] = []
+        for task_id, error in resolved:
+            if error is not None:
+                output.append(error)
+            else:
+                output.append(next(close_results))
+        return "\n".join(output)
 
     def _cmd_followup(self, arg: str) -> str:
         """Send a follow-up to a task awaiting closure."""
@@ -247,7 +280,8 @@ class Supervisor:
             "/tasks    — List all dispatched tasks\n"
             "/daemons  — List daemon (persistent) tasks\n"
             "/stop <id>       — Stop a daemon task\n"
-            "/close <id>      — Close a completed task\n"
+            "/close <id> [id2 ...] — Close one or more tasks\n"
+            "/close all       — Close all awaiting_closure tasks\n"
             "/followup <id> <text> — Ask follow-up on a completed task\n"
             "/reply <id> <text>    — Reply to a task waiting for input\n"
             "/skip <id>       — Skip review for a task\n"
@@ -257,7 +291,7 @@ class Supervisor:
             "• Tasks requiring execution → dispatched to worker\n"
             "• Complex tasks → decomposed into parallel workers\n\n"
             "When a task completes, you can ask follow-up questions.\n"
-            "Use /close <id> when you're done with a task."
+            "Use /close <id> when done, or /close all to close all at once."
         )
 
     def _find_task_by_prefix(self, prefix: str):
@@ -427,6 +461,9 @@ class Supervisor:
 
         elif action == "close":
             await self._handle_sonnet_close(result, chat_id, message_id)
+
+        elif action == "close_all":
+            await self._handle_sonnet_close_all(chat_id, message_id)
 
         elif action == "follow_up":
             await self._handle_sonnet_follow_up(result, text, chat_id, message_id)
@@ -621,34 +658,74 @@ class Supervisor:
         await self._handle_follow_up(task, follow_up_text, chat_id, message_id)
 
     async def _handle_sonnet_close(
-        self, result: dict, chat_id: str, message_id: str
+        self, result: dict, _chat_id: str, message_id: str
     ):
-        """Handle close action decided by sonnet."""
-        task_id_prefix = result.get("task_id", "")
-        if not task_id_prefix or not self._task_dispatcher:
-            self.gateway.reply_message(
-                message_id, "没有找到可关闭的任务，请用 /close <id> 指定。"
-            )
+        """Handle close action decided by sonnet. Supports single task_id or task_ids array."""
+        if not self._task_dispatcher:
+            reply_text = "没有找到可关闭的任务，请用 /close <id> 指定。"
+            self.gateway.reply_message(message_id, reply_text)
+            self._record_message("assistant", reply_text)
             return
 
-        matching = [
-            t for t in self._task_dispatcher.list_tasks()
-            if t.id.startswith(task_id_prefix) and t.status == "awaiting_closure"
-        ]
-        if not matching:
-            self.gateway.reply_message(
-                message_id,
-                f"未找到匹配的待关闭任务 (id={task_id_prefix})，请用 /tasks 查看。",
-            )
+        # Batch close: task_ids array takes priority over single task_id
+        task_id_prefixes = result.get("task_ids", [])
+        if not task_id_prefixes:
+            single_id = result.get("task_id", "")
+            task_id_prefixes = [single_id] if single_id else []
+
+        if not task_id_prefixes:
+            reply_text = "没有找到可关闭的任务，请用 /close <id> 指定。"
+            self.gateway.reply_message(message_id, reply_text)
+            self._record_message("assistant", reply_text)
             return
 
-        task = matching[0]
-        try:
-            self._task_dispatcher.close_task(task.id)
-        except ValueError as e:
-            self.gateway.reply_message(message_id, f"关闭失败: {e}")
+        # Resolve prefixes, preserving input order for interleaved output
+        all_tasks = self._task_dispatcher.list_tasks()
+        resolved: list[tuple[str | None, str | None]] = []  # (task_id, error)
+        for prefix in task_id_prefixes:
+            matching = [
+                t for t in all_tasks
+                if t.id.startswith(prefix) and t.status == "awaiting_closure"
+            ]
+            if matching:
+                resolved.append((matching[0].id, None))
+            else:
+                resolved.append((None, f"未找到匹配的待关闭任务 (id={prefix})"))
+
+        valid_ids = [tid for tid, _ in resolved if tid is not None]
+        if not valid_ids:
+            reply_text = "\n".join(err for _, err in resolved if err) + "\n请用 /tasks 查看。"
+            self.gateway.reply_message(message_id, reply_text)
+            self._record_message("assistant", reply_text)
             return
-        reply_text = f"任务 [{task.id[:8]}] 已关闭"
+
+        close_results = iter(self._task_dispatcher.close_tasks(valid_ids))
+        output: list[str] = []
+        for task_id, error in resolved:
+            if error is not None:
+                output.append(error)
+            else:
+                output.append(next(close_results))
+        reply_text = "\n".join(output)
+        self.gateway.reply_message(message_id, reply_text)
+        self._record_message("assistant", reply_text)
+
+    async def _handle_sonnet_close_all(self, _chat_id: str, message_id: str):
+        """Handle close_all action — close all tasks in awaiting_closure state."""
+        if not self._task_dispatcher:
+            self.gateway.reply_message(message_id, "Task dispatcher not available.")
+            return
+
+        awaiting = self._task_dispatcher.get_awaiting_closure()
+        if not awaiting:
+            reply_text = "没有待关闭的任务。"
+            self.gateway.reply_message(message_id, reply_text)
+            self._record_message("assistant", reply_text)
+            return
+
+        task_ids = [t.id for t in awaiting]
+        results = self._task_dispatcher.close_tasks(task_ids)
+        reply_text = "\n".join(results)
         self.gateway.reply_message(message_id, reply_text)
         self._record_message("assistant", reply_text)
 

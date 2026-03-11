@@ -75,6 +75,95 @@ class TestLocalCommands:
         reply_text = sup.gateway.reply_message.call_args[0][1]
         assert "Usage" in reply_text
 
+    def test_close_multiple_ids(self):
+        """'/close id1 id2' closes multiple tasks."""
+        sup = self._make_supervisor()
+        mock_dispatcher = MagicMock()
+        mock_t1 = MagicMock()
+        mock_t1.id = "aaaa1111-0000-0000-0000-000000000000"
+        mock_t2 = MagicMock()
+        mock_t2.id = "bbbb2222-0000-0000-0000-000000000000"
+        mock_dispatcher.list_tasks.return_value = [mock_t1, mock_t2]
+        mock_dispatcher.close_tasks.return_value = [
+            "Task aaaa1111 closed.",
+            "Task bbbb2222 closed.",
+        ]
+        sup._task_dispatcher = mock_dispatcher
+        sup._handle_local_command("/close aaaa1111 bbbb2222", "chat-1", "msg-1")
+        reply_text = sup.gateway.reply_message.call_args[0][1]
+        assert "aaaa1111" in reply_text
+        assert "bbbb2222" in reply_text
+        mock_dispatcher.close_tasks.assert_called_once_with(
+            [mock_t1.id, mock_t2.id]
+        )
+
+    def test_close_mixed_valid_and_invalid_prefix(self):
+        """'/close bad good' reports error for bad and closes the valid one."""
+        sup = self._make_supervisor()
+        mock_dispatcher = MagicMock()
+        mock_t1 = MagicMock()
+        mock_t1.id = "aaaa1111-0000-0000-0000-000000000000"
+        mock_dispatcher.list_tasks.return_value = [mock_t1]
+        mock_dispatcher.close_tasks.return_value = ["Task aaaa1111 closed."]
+        sup._task_dispatcher = mock_dispatcher
+        sup._handle_local_command("/close unknownprefix aaaa1111", "chat-1", "msg-1")
+        reply_text = sup.gateway.reply_message.call_args[0][1]
+        assert "aaaa1111" in reply_text
+        assert "No task found" in reply_text
+
+    def test_close_all_case_insensitive(self):
+        """'/close ALL' works the same as '/close all'."""
+        sup = self._make_supervisor()
+        mock_dispatcher = MagicMock()
+        mock_t1 = MagicMock()
+        mock_t1.id = "aaaa1111-0000-0000-0000-000000000000"
+        mock_dispatcher.get_awaiting_closure.return_value = [mock_t1]
+        mock_dispatcher.close_tasks.return_value = ["Task aaaa1111 closed."]
+        sup._task_dispatcher = mock_dispatcher
+        sup._handle_local_command("/close ALL", "chat-1", "msg-1")
+        reply_text = sup.gateway.reply_message.call_args[0][1]
+        assert "aaaa1111" in reply_text
+        mock_dispatcher.close_tasks.assert_called_once_with([mock_t1.id])
+
+    def test_close_all(self):
+        """'/close all' closes all awaiting_closure tasks."""
+        sup = self._make_supervisor()
+        mock_dispatcher = MagicMock()
+        mock_t1 = MagicMock()
+        mock_t1.id = "aaaa1111-0000-0000-0000-000000000000"
+        mock_t2 = MagicMock()
+        mock_t2.id = "bbbb2222-0000-0000-0000-000000000000"
+        mock_dispatcher.get_awaiting_closure.return_value = [mock_t1, mock_t2]
+        mock_dispatcher.close_tasks.return_value = [
+            "Task aaaa1111 closed.",
+            "Task bbbb2222 closed.",
+        ]
+        sup._task_dispatcher = mock_dispatcher
+        sup._handle_local_command("/close all", "chat-1", "msg-1")
+        reply_text = sup.gateway.reply_message.call_args[0][1]
+        assert "aaaa1111" in reply_text
+        assert "bbbb2222" in reply_text
+        mock_dispatcher.close_tasks.assert_called_once_with(
+            [mock_t1.id, mock_t2.id]
+        )
+
+    def test_close_all_nothing_to_close(self):
+        """'/close all' when no tasks awaiting closure."""
+        sup = self._make_supervisor()
+        mock_dispatcher = MagicMock()
+        mock_dispatcher.get_awaiting_closure.return_value = []
+        sup._task_dispatcher = mock_dispatcher
+        sup._handle_local_command("/close all", "chat-1", "msg-1")
+        reply_text = sup.gateway.reply_message.call_args[0][1]
+        assert "No tasks" in reply_text or "没有" in reply_text
+
+    def test_close_help_text_shows_batch(self):
+        """Help text mentions batch close and 'all' keyword."""
+        sup = self._make_supervisor()
+        sup._handle_local_command("/help", "chat-1", "msg-1")
+        reply_text = sup.gateway.reply_message.call_args[0][1]
+        assert "all" in reply_text.lower()
+
     def test_followup_no_arg(self):
         sup = self._make_supervisor()
         sup._handle_local_command("/followup", "chat-1", "msg-1")
@@ -791,7 +880,7 @@ class TestSonnetCloseAction:
 
             sup._task_dispatcher = MagicMock()
             sup._task_dispatcher.list_tasks.return_value = [mock_task]
-            sup._task_dispatcher.close_task.return_value = "Task aabb1122 closed."
+            sup._task_dispatcher.close_tasks.return_value = ["Task aabb1122 closed."]
 
             sup.claude.route_message = AsyncMock(
                 return_value={"action": "close", "task_id": "aabb1122"}
@@ -799,10 +888,10 @@ class TestSonnetCloseAction:
 
             await sup._route_message("关闭这个任务吧", "chat-1", "msg-1")
 
-            sup._task_dispatcher.close_task.assert_called_once_with(mock_task.id)
+            sup._task_dispatcher.close_tasks.assert_called_once_with([mock_task.id])
             sup.gateway.reply_message.assert_called()
             reply = sup.gateway.reply_message.call_args[0][1]
-            assert "关闭" in reply or "closed" in reply.lower()
+            assert "closed" in reply.lower()
 
         asyncio.run(_test())
 
@@ -851,7 +940,7 @@ class TestSonnetCloseAction:
 
             sup._task_dispatcher = MagicMock()
             sup._task_dispatcher.list_tasks.return_value = [mock_task]
-            sup._task_dispatcher.close_task.return_value = "Task aabb1122 closed."
+            sup._task_dispatcher.close_tasks.return_value = ["Task aabb1122 closed."]
 
             sup.claude.route_message = AsyncMock(
                 return_value={"action": "close", "task_id": "aabb1122"}
@@ -861,6 +950,131 @@ class TestSonnetCloseAction:
 
             assert any(m["role"] == "user" for m in sup._conversation_history)
             assert any(m["role"] == "assistant" for m in sup._conversation_history)
+
+        asyncio.run(_test())
+
+
+class TestSonnetBatchClose:
+    """Test that action=close_all from sonnet routing closes all awaiting tasks."""
+
+    def _make_supervisor(self):
+        with patch("supervisor.main.FeishuGateway"):
+            with patch("supervisor.main.ClaudeSession"):
+                sup = Supervisor()
+                sup.gateway = MagicMock()
+                sup.claude = MagicMock()
+                return sup
+
+    def test_close_all_action_closes_all_awaiting(self):
+        """When sonnet returns action=close_all, all awaiting_closure tasks should be closed."""
+        async def _test():
+            sup = self._make_supervisor()
+            mock_t1 = MagicMock()
+            mock_t1.id = "aabb1122-0000-0000-0000-000000000000"
+            mock_t1.status = "awaiting_closure"
+            mock_t2 = MagicMock()
+            mock_t2.id = "ccdd3344-0000-0000-0000-000000000000"
+            mock_t2.status = "awaiting_closure"
+
+            sup._task_dispatcher = MagicMock()
+            sup._task_dispatcher.get_awaiting_closure.return_value = [mock_t1, mock_t2]
+            sup._task_dispatcher.close_tasks.return_value = [
+                "Task aabb1122 closed.",
+                "Task ccdd3344 closed.",
+            ]
+
+            sup.claude.route_message = AsyncMock(
+                return_value={"action": "close_all"}
+            )
+
+            await sup._route_message("把这些任务都关了", "chat-1", "msg-1")
+
+            sup._task_dispatcher.close_tasks.assert_called_once_with(
+                [mock_t1.id, mock_t2.id]
+            )
+            sup.gateway.reply_message.assert_called()
+            reply = sup.gateway.reply_message.call_args[0][1]
+            assert "aabb1122" in reply
+            assert "ccdd3344" in reply
+
+        asyncio.run(_test())
+
+    def test_close_all_no_awaiting_tasks(self):
+        """When sonnet returns close_all but no tasks await closure, reply with message."""
+        async def _test():
+            sup = self._make_supervisor()
+            sup._task_dispatcher = MagicMock()
+            sup._task_dispatcher.get_awaiting_closure.return_value = []
+
+            sup.claude.route_message = AsyncMock(
+                return_value={"action": "close_all"}
+            )
+
+            await sup._route_message("全部关了吧", "chat-1", "msg-1")
+
+            sup.gateway.reply_message.assert_called()
+            reply = sup.gateway.reply_message.call_args[0][1]
+            assert "没有" in reply or "No" in reply
+
+        asyncio.run(_test())
+
+    def test_close_all_records_history(self):
+        """close_all action should record conversation history."""
+        async def _test():
+            sup = self._make_supervisor()
+            mock_t1 = MagicMock()
+            mock_t1.id = "aabb1122-0000-0000-0000-000000000000"
+            mock_t1.status = "awaiting_closure"
+
+            sup._task_dispatcher = MagicMock()
+            sup._task_dispatcher.get_awaiting_closure.return_value = [mock_t1]
+            sup._task_dispatcher.close_tasks.return_value = ["Task aabb1122 closed."]
+
+            sup.claude.route_message = AsyncMock(
+                return_value={"action": "close_all"}
+            )
+
+            await sup._route_message("全部关闭", "chat-1", "msg-1")
+
+            assert any(m["role"] == "user" for m in sup._conversation_history)
+            assert any(m["role"] == "assistant" for m in sup._conversation_history)
+
+        asyncio.run(_test())
+
+    def test_close_with_task_ids_array(self):
+        """When sonnet returns close with task_ids array, close specified tasks."""
+        async def _test():
+            sup = self._make_supervisor()
+            mock_t1 = MagicMock()
+            mock_t1.id = "aabb1122-0000-0000-0000-000000000000"
+            mock_t1.status = "awaiting_closure"
+            mock_t2 = MagicMock()
+            mock_t2.id = "ccdd3344-0000-0000-0000-000000000000"
+            mock_t2.status = "awaiting_closure"
+            mock_t3 = MagicMock()
+            mock_t3.id = "eeff5566-0000-0000-0000-000000000000"
+            mock_t3.status = "awaiting_closure"
+
+            sup._task_dispatcher = MagicMock()
+            sup._task_dispatcher.list_tasks.return_value = [mock_t1, mock_t2, mock_t3]
+            sup._task_dispatcher.close_tasks.return_value = [
+                "Task aabb1122 closed.",
+                "Task ccdd3344 closed.",
+            ]
+
+            sup.claude.route_message = AsyncMock(
+                return_value={"action": "close", "task_ids": ["aabb1122", "ccdd3344"]}
+            )
+
+            await sup._route_message("把前两个任务关了", "chat-1", "msg-1")
+
+            sup._task_dispatcher.close_tasks.assert_called_once_with(
+                [mock_t1.id, mock_t2.id]
+            )
+            sup.gateway.reply_message.assert_called()
+            reply = sup.gateway.reply_message.call_args[0][1]
+            assert "aabb1122" in reply
+            assert "ccdd3344" in reply
 
         asyncio.run(_test())
 
@@ -885,7 +1099,7 @@ class TestSmartCloseFallback:
 
             sup._task_dispatcher = MagicMock()
             sup._task_dispatcher.list_tasks.return_value = [mock_task]
-            sup._task_dispatcher.close_task.return_value = "Task ccdd3344 closed."
+            sup._task_dispatcher.close_tasks.return_value = ["Task ccdd3344 closed."]
             sup._task_dispatcher.follow_up_async = AsyncMock()
 
             sup.claude.route_message = AsyncMock(
@@ -898,7 +1112,7 @@ class TestSmartCloseFallback:
 
             await sup._route_message("检查系统日志那个关闭了", "chat-1", "msg-1")
 
-            sup._task_dispatcher.close_task.assert_called_once_with(mock_task.id)
+            sup._task_dispatcher.close_tasks.assert_called_once_with([mock_task.id])
             sup._task_dispatcher.follow_up_async.assert_not_called()
 
         asyncio.run(_test())
