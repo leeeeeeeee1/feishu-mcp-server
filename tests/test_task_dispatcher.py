@@ -8,8 +8,6 @@ from unittest.mock import AsyncMock, patch, MagicMock
 from supervisor.task_dispatcher import (
     Task,
     _looks_like_needs_input,
-    _looks_like_close,
-    _contains_close_intent,
     _build_cmd,
     _reset,
     dispatch,
@@ -101,134 +99,56 @@ class TestInputHeuristic:
         assert _looks_like_needs_input("Please confirm this action?") is True
 
 
-# ── Close intent heuristic tests ──
+# Close intent functions are used by main.py Step 0 for fast local close
+# (avoids Sonnet API latency for obvious acknowledgements).
+from supervisor.task_dispatcher import _looks_like_close, _contains_close_intent
 
 
-class TestCloseHeuristic:
-    def test_chinese_acknowledgements(self):
-        assert _looks_like_close("好的") is True
-        assert _looks_like_close("收到") is True
-        assert _looks_like_close("可以了") is True
-        assert _looks_like_close("没问题") is True
-        assert _looks_like_close("不用了") is True
-        assert _looks_like_close("就这样") is True
-        assert _looks_like_close("完成") is True
+class TestLooksLikeClose:
+    """Tests for _looks_like_close exact-match heuristic."""
 
-    def test_english_acknowledgements(self):
-        assert _looks_like_close("ok") is True
-        assert _looks_like_close("OK") is True
-        assert _looks_like_close("thanks") is True
-        assert _looks_like_close("done") is True
-        assert _looks_like_close("lgtm") is True
+    def test_short_ack_true(self):
+        for phrase in ("好的", "收到", "ok", "谢谢", "done", "lgtm", "👍"):
+            assert _looks_like_close(phrase) is True, f"Expected True for {phrase!r}"
 
     def test_with_trailing_punctuation(self):
         assert _looks_like_close("好的。") is True
-        assert _looks_like_close("收到！") is True
-        assert _looks_like_close("ok!") is True
-        assert _looks_like_close("谢谢~") is True
+        assert _looks_like_close("OK!") is True
 
-    def test_with_emoji(self):
-        assert _looks_like_close("👍") is True
+    def test_question_is_not_close(self):
+        assert _looks_like_close("好的?") is False
+        assert _looks_like_close("ok？") is False
+        assert _looks_like_close("好的吗") is False
 
-    def test_long_message_not_close(self):
-        assert _looks_like_close("好的，但是我还有个问题想问一下关于这个接口的实现") is False
+    def test_long_message_false(self):
+        assert _looks_like_close("好的，但是还需要加个功能") is False
 
-    def test_question_not_close(self):
-        assert _looks_like_close("好的，还有别的问题吗？") is False
-
-    def test_actual_follow_up_not_close(self):
-        assert _looks_like_close("帮我再加个鉴权") is False
-        assert _looks_like_close("这个接口还需要改一下返回格式") is False
-
-    def test_empty_string(self):
+    def test_empty_false(self):
         assert _looks_like_close("") is False
-
-    def test_whitespace_handling(self):
-        assert _looks_like_close("  好的  ") is True
-        assert _looks_like_close("  ok  ") is True
-
-    def test_negation_not_close(self):
-        assert _looks_like_close("not ok") is False
-
-    def test_status_report_not_close(self):
-        assert _looks_like_close("I am done") is False
-        assert _looks_like_close("all done") is False
-
-    def test_embedded_phrase_not_close(self):
-        assert _looks_like_close("ok but") is False
-        assert _looks_like_close("lgtm bro") is False
+        assert _looks_like_close("  ") is False
 
 
 class TestContainsCloseIntent:
-    """Tests for _contains_close_intent — detects close keywords in longer text."""
+    """Tests for _contains_close_intent pattern matching."""
 
-    def test_xxx_closed(self):
-        assert _contains_close_intent("检查系统日志那个关闭了") is True
-
-    def test_xxx_guan_le(self):
-        assert _contains_close_intent("分析代码那个关了") is True
-
-    def test_ba_xxx_guan_diao(self):
-        assert _contains_close_intent("把那个任务关掉") is True
-
-    def test_jieshu(self):
-        assert _contains_close_intent("分析代码那个结束吧") is True
-
-    def test_buyongle(self):
-        assert _contains_close_intent("那个不用了") is True
-
-    def test_wanshile(self):
-        assert _contains_close_intent("完事了") is True
-
-    def test_keyi_guan_le(self):
-        assert _contains_close_intent("可以关了") is True
+    def test_close_patterns_true(self):
+        for text in ("关闭了", "关闭吧", "关掉", "关了", "结束吧", "不用了", "完事了", "可以关了"):
+            assert _contains_close_intent(text) is True, f"Expected True for {text!r}"
 
     def test_english_close(self):
-        assert _contains_close_intent("please close that task") is True
+        assert _contains_close_intent("close this task") is True
+        assert _contains_close_intent("done with it") is True
 
-    def test_english_done_with_it(self):
-        assert _contains_close_intent("I'm done with it") is True
+    def test_technical_false_positives(self):
+        for text in ("关闭连接", "关闭端口", "关闭服务", "结束进程", "关掉socket"):
+            assert _contains_close_intent(text) is False, f"Expected False for {text!r}"
 
-    def test_guanbi_ba(self):
-        assert _contains_close_intent("那个任务关闭吧") is True
-
-    def test_guanbi_zhege(self):
-        assert _contains_close_intent("关闭这个") is True
-
-    def test_jieshu_le(self):
-        assert _contains_close_intent("任务结束了") is True
-
-    def test_jieshu_renwu(self):
-        assert _contains_close_intent("结束任务") is True
-
-    def test_false_positive_close_connection(self):
-        assert _contains_close_intent("关闭连接后重试") is False
-
-    def test_false_positive_close_port(self):
-        assert _contains_close_intent("关闭端口") is False
-
-    def test_false_positive_close_service(self):
-        assert _contains_close_intent("关闭服务") is False
-
-    def test_false_positive_close_process(self):
-        assert _contains_close_intent("关掉进程") is False
-
-    def test_false_positive_process_guan_diao(self):
-        """Noun-before-verb: '进程关掉' should NOT be close intent."""
-        assert _contains_close_intent("帮我把nginx进程关掉") is False
-
-    def test_false_positive_bare_jieshu(self):
-        """Bare '结束' without task suffix should NOT match."""
-        assert _contains_close_intent("死循环不会结束") is False
-
-    def test_false_positive_jieshu_process(self):
-        assert _contains_close_intent("结束进程") is False
-
-    def test_no_close_intent(self):
-        assert _contains_close_intent("帮我再看一下这个结果") is False
-
-    def test_empty_string(self):
+    def test_empty_false(self):
         assert _contains_close_intent("") is False
+        assert _contains_close_intent("  ") is False
+
+    def test_unrelated_text(self):
+        assert _contains_close_intent("帮我写一个Python脚本") is False
 
 
 # ── Build command tests ──

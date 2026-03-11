@@ -325,8 +325,8 @@ class TestRouteMessageDispatch:
         asyncio.run(_test())
 
 
-class TestRouteMessageDispatchMulti:
-    """Test that action=dispatch_multi decomposes into parallel tasks."""
+class TestRouteMessageOrchestrate:
+    """Test that orchestrate/dispatch_multi creates a single orchestrator task."""
 
     def _make_supervisor(self):
         with patch("supervisor.main.FeishuGateway"):
@@ -336,21 +336,41 @@ class TestRouteMessageDispatchMulti:
                 sup.claude = MagicMock()
                 sup._task_dispatcher = MagicMock()
                 sup._task_dispatcher.get_awaiting_closure.return_value = []
-                sup._task_dispatcher.dispatch = AsyncMock(return_value=MagicMock())
+                sup._task_dispatcher.list_tasks.return_value = []
+                mock_task = MagicMock()
+                mock_task.id = "aaaa1111-bbbb-cccc-dddd-eeeeffffgggg"
+                sup._task_dispatcher.dispatch = AsyncMock(return_value=mock_task)
                 return sup
 
-    def test_dispatch_multi_creates_multiple_tasks(self):
+    def test_orchestrate_creates_single_task(self):
+        """Orchestrate dispatches exactly ONE orchestrator task."""
+        async def _test():
+            sup = self._make_supervisor()
+            sup.claude.route_message = AsyncMock(
+                return_value={
+                    "action": "orchestrate",
+                    "description": "重构项目",
+                    "subtasks": ["分析代码结构", "检查测试覆盖", "审计依赖"],
+                }
+            )
+            await sup._route_message("重构整个项目", "chat-1", "msg-1")
+            assert sup._task_dispatcher.dispatch.call_count == 1
+
+        asyncio.run(_test())
+
+    def test_dispatch_multi_compat_creates_single_task(self):
+        """Legacy dispatch_multi also creates a single orchestrator task."""
         async def _test():
             sup = self._make_supervisor()
             sup.claude.route_message = AsyncMock(
                 return_value={
                     "action": "dispatch_multi",
                     "description": "重构项目",
-                    "subtasks": ["分析代码结构", "检查测试覆盖", "审计依赖"],
+                    "subtasks": ["A", "B", "C"],
                 }
             )
             await sup._route_message("重构整个项目", "chat-1", "msg-1")
-            assert sup._task_dispatcher.dispatch.call_count == 3
+            assert sup._task_dispatcher.dispatch.call_count == 1
 
         asyncio.run(_test())
 
@@ -366,13 +386,15 @@ class TestFollowUpRouting:
                 sup.claude = MagicMock()
                 return sup
 
-    def test_explicit_task_id_routes_to_follow_up(self):
-        """Message containing a task ID prefix should route directly to that task."""
+    def test_explicit_task_id_routes_through_sonnet(self):
+        """Message containing a task ID now goes through Sonnet (no hardcoded bypass)."""
         async def _test():
             sup = self._make_supervisor()
             mock_task = MagicMock()
             mock_task.id = "8b557777-abcd-1234-5678-123456789abc"
             mock_task.status = "awaiting_closure"
+            mock_task.description = "分析代码"
+            mock_task.prompt = "分析代码"
             mock_task.session_id = "sess-1"
 
             sup._task_dispatcher = MagicMock()
@@ -381,11 +403,17 @@ class TestFollowUpRouting:
             sup._task_dispatcher.get_task.return_value = mock_task
             sup._task_dispatcher.follow_up_async = AsyncMock(return_value="Follow-up result")
 
-            # Message contains task ID prefix
+            # Sonnet classifies as follow_up
+            sup.claude.route_message = AsyncMock(return_value={
+                "action": "follow_up", "task_id": "8b557777",
+                "text": "这个结果对吗",
+            })
+            sup.gateway.send_message.return_value = "msg-200"
+
             await sup._route_message("8b557777 这个结果对吗", "chat-1", "msg-1")
 
-            sup._task_dispatcher.follow_up_async.assert_called_once()
-            sup.claude.route_message.assert_not_called()
+            # All routing goes through Sonnet
+            sup.claude.route_message.assert_called_once()
 
         asyncio.run(_test())
 
@@ -1079,8 +1107,8 @@ class TestSonnetBatchClose:
         asyncio.run(_test())
 
 
-class TestSmartCloseFallback:
-    """Test that follow_up with close intent in original text auto-closes instead."""
+class TestSonnetFollowUpTrusted:
+    """Test that Sonnet's follow_up decision is trusted (no hardcoded override)."""
 
     def _make_supervisor(self):
         with patch("supervisor.main.FeishuGateway"):
@@ -1090,34 +1118,8 @@ class TestSmartCloseFallback:
                 sup.claude = MagicMock()
                 return sup
 
-    def test_follow_up_with_close_intent_auto_closes(self):
-        async def _test():
-            sup = self._make_supervisor()
-            mock_task = MagicMock()
-            mock_task.id = "ccdd3344-abcd-efgh-ijkl-123456789abc"
-            mock_task.status = "awaiting_closure"
-
-            sup._task_dispatcher = MagicMock()
-            sup._task_dispatcher.list_tasks.return_value = [mock_task]
-            sup._task_dispatcher.close_tasks.return_value = ["Task ccdd3344 closed."]
-            sup._task_dispatcher.follow_up_async = AsyncMock()
-
-            sup.claude.route_message = AsyncMock(
-                return_value={
-                    "action": "follow_up",
-                    "task_id": "ccdd3344",
-                    "text": "用户想关闭这个任务",
-                }
-            )
-
-            await sup._route_message("检查系统日志那个关闭了", "chat-1", "msg-1")
-
-            sup._task_dispatcher.close_tasks.assert_called_once_with([mock_task.id])
-            sup._task_dispatcher.follow_up_async.assert_not_called()
-
-        asyncio.run(_test())
-
-    def test_follow_up_without_close_intent_proceeds(self):
+    def test_follow_up_action_respected(self):
+        """Sonnet says follow_up → follow_up executed, no close override."""
         async def _test():
             sup = self._make_supervisor()
             mock_task = MagicMock()
@@ -1146,8 +1148,8 @@ class TestSmartCloseFallback:
 
         asyncio.run(_test())
 
-    def test_technical_close_not_intercepted(self):
-        """'关闭连接' should NOT trigger smart close."""
+    def test_follow_up_with_close_words_still_follows_up(self):
+        """Sonnet says follow_up even though text has '关闭' → trust Sonnet, follow up."""
         async def _test():
             sup = self._make_supervisor()
             mock_task = MagicMock()
@@ -1161,6 +1163,7 @@ class TestSmartCloseFallback:
 
             sup.gateway.send_message.return_value = "msg-200"
 
+            # Sonnet correctly classifies "关闭连接后重试" as follow_up (technical op)
             sup.claude.route_message = AsyncMock(
                 return_value={
                     "action": "follow_up",
@@ -1171,14 +1174,15 @@ class TestSmartCloseFallback:
 
             await sup._route_message("帮我关闭连接后重试", "chat-1", "msg-1")
 
+            # No hardcoded override — Sonnet's follow_up is respected
             sup._task_dispatcher.close_task.assert_not_called()
             sup._task_dispatcher.follow_up_async.assert_called_once()
 
         asyncio.run(_test())
 
 
-class TestReplyBasedClose:
-    """Test that short acknowledgement replies auto-close tasks."""
+class TestReplyBasedRouting:
+    """Test that reply-based messages go through Sonnet with reply context."""
 
     def _make_supervisor(self):
         with patch("supervisor.main.FeishuGateway"):
@@ -1189,17 +1193,19 @@ class TestReplyBasedClose:
                 return sup
 
     def test_reply_ok_closes_task(self):
-        """Replying '好的' to a task result should close, not follow-up."""
+        """Replying '好的' to a task result should close the task."""
         async def _test():
             sup = self._make_supervisor()
             mock_task = MagicMock()
             mock_task.id = "aaaabbbb-1234-5678-9abc-123456789abc"
             mock_task.status = "awaiting_closure"
+            mock_task.description = "test task"
+            mock_task.prompt = "test prompt"
 
             sup._task_dispatcher = MagicMock()
             sup._task_dispatcher.get_task.return_value = mock_task
-            sup._task_dispatcher.close_task.return_value = "Task aaaabbbb closed."
-            sup._task_dispatcher.follow_up_async = AsyncMock()
+            sup._task_dispatcher.list_tasks.return_value = [mock_task]
+            sup._task_dispatcher.close_task.return_value = "closed"
 
             sup._message_task_map["feishu-msg-100"] = mock_task.id
 
@@ -1209,48 +1215,101 @@ class TestReplyBasedClose:
             )
 
             sup._task_dispatcher.close_task.assert_called_once_with(mock_task.id)
-            sup._task_dispatcher.follow_up_async.assert_not_called()
 
         asyncio.run(_test())
 
-    def test_reply_thanks_closes_task(self):
-        """Replying '谢谢' should close."""
+    def test_reply_non_obvious_provides_reply_context_to_sonnet(self):
+        """Non-obvious reply passes reply_to_task context to Sonnet prompt."""
         async def _test():
             sup = self._make_supervisor()
             mock_task = MagicMock()
             mock_task.id = "aaaabbbb-1234-5678-9abc-123456789abc"
             mock_task.status = "awaiting_closure"
-
-            sup._task_dispatcher = MagicMock()
-            sup._task_dispatcher.get_task.return_value = mock_task
-            sup._task_dispatcher.close_task.return_value = "closed"
-            sup._task_dispatcher.follow_up_async = AsyncMock()
-
-            sup._message_task_map["feishu-msg-100"] = mock_task.id
-
-            await sup._route_message(
-                "谢谢", "chat-1", "msg-reply-1",
-                parent_id="feishu-msg-100",
-            )
-
-            sup._task_dispatcher.close_task.assert_called_once()
-            sup._task_dispatcher.follow_up_async.assert_not_called()
-
-        asyncio.run(_test())
-
-    def test_reply_long_message_triggers_follow_up(self):
-        """A long reply should still trigger follow-up, not close."""
-        async def _test():
-            sup = self._make_supervisor()
-            mock_task = MagicMock()
-            mock_task.id = "aaaabbbb-1234-5678-9abc-123456789abc"
-            mock_task.status = "awaiting_closure"
+            mock_task.description = "分析代码"
+            mock_task.prompt = "分析代码"
             mock_task.session_id = "sess-1"
 
             sup._task_dispatcher = MagicMock()
             sup._task_dispatcher.get_task.return_value = mock_task
+            sup._task_dispatcher.list_tasks.return_value = [mock_task]
             sup._task_dispatcher.follow_up_async = AsyncMock(return_value="result")
 
+            sup.claude.route_message = AsyncMock(return_value={
+                "action": "follow_up", "task_id": "aaaabbbb",
+                "text": "这个结果有一处不对",
+            })
+            sup.gateway.send_message.return_value = "msg-200"
+
+            sup._message_task_map["feishu-msg-100"] = mock_task.id
+
+            await sup._route_message(
+                "这个结果有一处不对", "chat-1", "msg-reply-1",
+                parent_id="feishu-msg-100",
+            )
+
+            # Check that Sonnet was called with reply context in user_prompt
+            call_args = sup.claude.route_message.call_args
+            user_prompt = call_args[0][2]  # third positional arg
+            assert "Reply context" in user_prompt
+            assert "aaaabbbb" in user_prompt
+
+        asyncio.run(_test())
+
+    def test_reply_technical_close_through_sonnet(self):
+        """Reply '关闭连接后重试' → Sonnet classifies as follow_up (technical op)."""
+        async def _test():
+            sup = self._make_supervisor()
+            mock_task = MagicMock()
+            mock_task.id = "aaaabbbb-1234-5678-9abc-123456789abc"
+            mock_task.status = "awaiting_closure"
+            mock_task.description = "test task"
+            mock_task.prompt = "test prompt"
+            mock_task.session_id = "sess-1"
+
+            sup._task_dispatcher = MagicMock()
+            sup._task_dispatcher.get_task.return_value = mock_task
+            sup._task_dispatcher.list_tasks.return_value = [mock_task]
+            sup._task_dispatcher.follow_up_async = AsyncMock(return_value="result")
+
+            # Sonnet correctly classifies technical close as follow_up
+            sup.claude.route_message = AsyncMock(return_value={
+                "action": "follow_up", "task_id": "aaaabbbb", "text": "关闭连接后重试",
+            })
+            sup.gateway.send_message.return_value = "msg-200"
+
+            sup._message_task_map["feishu-msg-100"] = mock_task.id
+
+            await sup._route_message(
+                "关闭连接后重试", "chat-1", "msg-reply-1",
+                parent_id="feishu-msg-100",
+            )
+
+            # All routing through Sonnet — no hardcoded close
+            sup._task_dispatcher.close_task.assert_not_called()
+            sup.claude.route_message.assert_called_once()
+
+        asyncio.run(_test())
+
+    def test_reply_long_follow_up_through_sonnet(self):
+        """A long reply → Sonnet classifies as follow_up."""
+        async def _test():
+            sup = self._make_supervisor()
+            mock_task = MagicMock()
+            mock_task.id = "aaaabbbb-1234-5678-9abc-123456789abc"
+            mock_task.status = "awaiting_closure"
+            mock_task.description = "test task"
+            mock_task.prompt = "test prompt"
+            mock_task.session_id = "sess-1"
+
+            sup._task_dispatcher = MagicMock()
+            sup._task_dispatcher.get_task.return_value = mock_task
+            sup._task_dispatcher.list_tasks.return_value = [mock_task]
+            sup._task_dispatcher.follow_up_async = AsyncMock(return_value="result")
+
+            sup.claude.route_message = AsyncMock(return_value={
+                "action": "follow_up", "task_id": "aaaabbbb",
+                "text": "好的，但是这个接口还需要加个鉴权功能",
+            })
             sup.gateway.send_message.return_value = "msg-200"
 
             sup._message_task_map["feishu-msg-100"] = mock_task.id
@@ -1260,7 +1319,9 @@ class TestReplyBasedClose:
                 parent_id="feishu-msg-100",
             )
 
-            sup._task_dispatcher.follow_up_async.assert_called_once()
+            # No close intent detected locally → falls to Sonnet
+            sup._task_dispatcher.close_task.assert_not_called()
+            sup.claude.route_message.assert_called_once()
 
         asyncio.run(_test())
 
@@ -1314,18 +1375,29 @@ class TestReplyBasedFollowUp:
         assert len(sup._message_task_map) == 0
 
     def test_reply_to_task_message_routes_follow_up(self):
-        """Reply to a task result message should auto-route as follow_up."""
+        """Reply to a task result message: Sonnet classifies as follow_up."""
         async def _test():
             sup = self._make_supervisor()
             mock_task = MagicMock()
             mock_task.id = "aaaabbbb-1234-5678-9abc-123456789abc"
             mock_task.status = "awaiting_closure"
             mock_task.session_id = "sess-1"
+            mock_task.description = "分析代码"
+            mock_task.prompt = "分析代码"
+            mock_task.result = None
+            mock_task.finished_at = None
 
             sup._task_dispatcher = MagicMock()
             sup._task_dispatcher.list_tasks.return_value = [mock_task]
             sup._task_dispatcher.get_task.return_value = mock_task
             sup._task_dispatcher.follow_up_async = AsyncMock(return_value="Follow-up result")
+
+            # Sonnet returns follow_up action for question-style replies
+            sup.claude.route_message = AsyncMock(return_value={
+                "action": "follow_up",
+                "task_id": "aaaabbbb",
+                "text": "这个结果对吗",
+            })
 
             # Simulate: task result was sent as feishu-msg-100
             sup._message_task_map["feishu-msg-100"] = mock_task.id
@@ -1336,9 +1408,9 @@ class TestReplyBasedFollowUp:
                 parent_id="feishu-msg-100",
             )
 
-            # Should auto-route to follow_up, NOT go through sonnet
+            # Sonnet classifies, then follow_up is dispatched
+            sup.claude.route_message.assert_called_once()
             sup._task_dispatcher.follow_up_async.assert_called_once()
-            sup.claude.route_message.assert_not_called()
 
         asyncio.run(_test())
 
@@ -1439,11 +1511,22 @@ class TestReplyBasedFollowUp:
             mock_task.id = "aaaabbbb-1234-5678-9abc-123456789abc"
             mock_task.status = "awaiting_closure"
             mock_task.session_id = "sess-1"
+            mock_task.description = "分析代码"
+            mock_task.prompt = "分析代码"
+            mock_task.result = None
+            mock_task.finished_at = None
 
             sup._task_dispatcher = MagicMock()
             sup._task_dispatcher.list_tasks.return_value = [mock_task]
             sup._task_dispatcher.get_task.return_value = mock_task
             sup._task_dispatcher.follow_up_async = AsyncMock(return_value="First follow-up result")
+
+            # Sonnet classifies as follow_up
+            sup.claude.route_message = AsyncMock(return_value={
+                "action": "follow_up",
+                "task_id": "aaaabbbb",
+                "text": "这个结果对吗",
+            })
 
             # Gateway returns message IDs for sent messages
             sup.gateway.reply_message.return_value = "msg-ack"
@@ -1480,3 +1563,133 @@ class TestReplyBasedFollowUp:
 
         sup._notify_task_result(task, "chat-1")
         assert len(sup._message_task_map) <= 501  # 500 kept + 1 new
+
+
+class TestReplyQuickClose:
+    """Test Step 0 fast local close for reply-based acknowledgements.
+
+    When a user replies to a task result with an obvious acknowledgement
+    (short phrase or close intent), we close immediately without Sonnet.
+    """
+
+    def _make_supervisor(self):
+        with patch("supervisor.main.FeishuGateway"):
+            with patch("supervisor.main.ClaudeSession"):
+                sup = Supervisor()
+                sup.gateway = MagicMock()
+                sup.claude = MagicMock()
+                return sup
+
+    def test_reply_ok_quick_closes(self):
+        """'好的' reply to task result closes immediately without Sonnet."""
+        async def _test():
+            sup = self._make_supervisor()
+            mock_task = MagicMock()
+            mock_task.id = "aaaabbbb-1234-5678-9abc-123456789abc"
+            mock_task.status = "awaiting_closure"
+
+            sup._task_dispatcher = MagicMock()
+            sup._task_dispatcher.get_task.return_value = mock_task
+            sup._task_dispatcher.close_task.return_value = "Task aaaabbbb closed."
+
+            sup._message_task_map["feishu-msg-100"] = mock_task.id
+
+            await sup._route_message(
+                "好的", "chat-1", "msg-reply-1",
+                parent_id="feishu-msg-100",
+            )
+
+            sup._task_dispatcher.close_task.assert_called_once_with(mock_task.id)
+            sup.claude.route_message.assert_not_called()
+
+        asyncio.run(_test())
+
+    def test_reply_close_intent_quick_closes(self):
+        """'关闭这个任务吧' reply closes immediately (close intent detected)."""
+        async def _test():
+            sup = self._make_supervisor()
+            mock_task = MagicMock()
+            mock_task.id = "aaaabbbb-1234-5678-9abc-123456789abc"
+            mock_task.status = "awaiting_closure"
+
+            sup._task_dispatcher = MagicMock()
+            sup._task_dispatcher.get_task.return_value = mock_task
+            sup._task_dispatcher.close_task.return_value = "closed"
+
+            sup._message_task_map["feishu-msg-100"] = mock_task.id
+
+            await sup._route_message(
+                "关闭这个任务吧", "chat-1", "msg-reply-1",
+                parent_id="feishu-msg-100",
+            )
+
+            sup._task_dispatcher.close_task.assert_called_once_with(mock_task.id)
+            sup.claude.route_message.assert_not_called()
+
+        asyncio.run(_test())
+
+    def test_reply_technical_close_falls_to_sonnet(self):
+        """'关闭连接后重试' (technical) falls through to Sonnet routing."""
+        async def _test():
+            sup = self._make_supervisor()
+            mock_task = MagicMock()
+            mock_task.id = "aaaabbbb-1234-5678-9abc-123456789abc"
+            mock_task.status = "awaiting_closure"
+            mock_task.description = "test task"
+            mock_task.prompt = "test prompt"
+
+            sup._task_dispatcher = MagicMock()
+            sup._task_dispatcher.get_task.return_value = mock_task
+            sup._task_dispatcher.list_tasks.return_value = [mock_task]
+
+            sup.claude.route_message = AsyncMock(return_value={
+                "action": "follow_up", "task_id": "aaaabbbb",
+                "text": "关闭连接后重试",
+            })
+            sup._task_dispatcher.follow_up_async = AsyncMock(return_value="result")
+            sup.gateway.send_message.return_value = "msg-200"
+
+            sup._message_task_map["feishu-msg-100"] = mock_task.id
+
+            await sup._route_message(
+                "关闭连接后重试", "chat-1", "msg-reply-1",
+                parent_id="feishu-msg-100",
+            )
+
+            sup._task_dispatcher.close_task.assert_not_called()
+            sup.claude.route_message.assert_called_once()
+
+        asyncio.run(_test())
+
+    def test_reply_long_no_close_intent_falls_to_sonnet(self):
+        """Long reply without close intent falls through to Sonnet."""
+        async def _test():
+            sup = self._make_supervisor()
+            mock_task = MagicMock()
+            mock_task.id = "aaaabbbb-1234-5678-9abc-123456789abc"
+            mock_task.status = "awaiting_closure"
+            mock_task.description = "test task"
+            mock_task.prompt = "test prompt"
+
+            sup._task_dispatcher = MagicMock()
+            sup._task_dispatcher.get_task.return_value = mock_task
+            sup._task_dispatcher.list_tasks.return_value = [mock_task]
+
+            sup.claude.route_message = AsyncMock(return_value={
+                "action": "follow_up", "task_id": "aaaabbbb",
+                "text": "还需要加鉴权",
+            })
+            sup._task_dispatcher.follow_up_async = AsyncMock(return_value="result")
+            sup.gateway.send_message.return_value = "msg-200"
+
+            sup._message_task_map["feishu-msg-100"] = mock_task.id
+
+            await sup._route_message(
+                "好的，但是这个接口还需要加个鉴权功能", "chat-1", "msg-reply-1",
+                parent_id="feishu-msg-100",
+            )
+
+            sup._task_dispatcher.close_task.assert_not_called()
+            sup.claude.route_message.assert_called_once()
+
+        asyncio.run(_test())

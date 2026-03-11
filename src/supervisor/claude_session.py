@@ -193,6 +193,8 @@ class ClaudeSession:
                 cwd=cwd,
             )
 
+            if self._process.stdout is None:
+                raise RuntimeError("stdout pipe not opened")
             async for line in self._process.stdout:
                 decoded = line.decode("utf-8", errors="replace")
                 event = _parse_stream_line(decoded)
@@ -282,7 +284,7 @@ class ClaudeSession:
             return text or "(empty response)"
 
     # Valid actions that sonnet can return
-    _VALID_ACTIONS = frozenset({"reply", "dispatch", "dispatch_multi", "follow_up", "close"})
+    _VALID_ACTIONS = frozenset({"reply", "dispatch", "orchestrate", "dispatch_multi", "follow_up", "close", "close_all"})
 
     # Route model — sonnet via direct API (fast) or CLI fallback
     _ROUTE_MODEL = "claude-sonnet-4-6"
@@ -325,12 +327,12 @@ class ClaudeSession:
         # ── Try 1: Standard JSON parse
         parsed = self._try_json_parse(result_text)
         if parsed:
-            return parsed
+            return self._normalize_action(parsed)
 
         # ── Try 2: Regex-based extraction (handles unescaped quotes in text)
         parsed = self._try_regex_extract(result_text)
         if parsed:
-            return parsed
+            return self._normalize_action(parsed)
 
         # ── Try 3: Plain text heuristic (sonnet ignored JSON instruction)
         if not result_text.strip().startswith("{"):
@@ -403,7 +405,8 @@ class ClaudeSession:
                 ),
                 timeout=30,
             )
-            result = response.content[0].text if response.content else ""
+            text_blocks = [b.text for b in response.content if hasattr(b, "text")]
+            result = text_blocks[0] if text_blocks else ""
             logger.info("Route via API: %d input tokens, %d output tokens",
                         response.usage.input_tokens, response.usage.output_tokens)
             return result
@@ -495,14 +498,33 @@ class ClaudeSession:
             if task_id:
                 return {"action": "follow_up", "task_id": task_id, "text": follow_text or ""}
 
-        elif action == "dispatch_multi":
+        elif action in ("orchestrate", "dispatch_multi"):
             desc = self._extract_field_value(text, "description")
             subtasks_match = re.search(r'"subtasks"\s*:\s*\[(.*?)\]', text, re.DOTALL)
             if subtasks_match:
                 subtasks = re.findall(r'"([^"]+)"', subtasks_match.group(1))
                 if subtasks:
-                    return {"action": "dispatch_multi", "description": desc or "", "subtasks": subtasks}
+                    return {"action": "orchestrate", "description": desc or "", "subtasks": subtasks}
             return {"action": "dispatch", "description": desc or ""}
+
+        elif action == "close":
+            task_id = self._extract_field_value(text, "task_id")
+            result: dict = {"action": "close"}
+            if task_id:
+                result["task_id"] = task_id
+            # Also try task_ids array (takes precedence in _handle_sonnet_close)
+            ids_match = re.search(r'"task_ids"\s*:\s*\[(.*?)\]', text, re.DOTALL)
+            if ids_match:
+                task_ids = re.findall(r'"([^"]+)"', ids_match.group(1))
+                if task_ids:
+                    result["task_ids"] = task_ids
+            # Require at least one identifier — otherwise fall through to dispatch
+            if len(result) == 1:
+                return None
+            return result
+
+        elif action == "close_all":
+            return {"action": "close_all"}
 
         logger.info("Regex extracted action=%s from malformed JSON", action)
         return None
@@ -555,6 +577,16 @@ class ClaudeSession:
             return remaining[:last_quote]
 
         return remaining.rstrip('"}')
+
+    @staticmethod
+    def _normalize_action(parsed: dict) -> dict:
+        """Normalize legacy action names to current ones.
+
+        dispatch_multi → orchestrate (backward compatibility).
+        """
+        if parsed.get("action") == "dispatch_multi":
+            return {**parsed, "action": "orchestrate"}
+        return parsed
 
     @staticmethod
     def _strip_markdown_wrapper(text: str) -> str:

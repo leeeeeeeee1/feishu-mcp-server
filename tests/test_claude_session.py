@@ -549,12 +549,12 @@ class TestClaudeSession:
                     assert result["action"] == "reply"
         asyncio.run(_test())
 
-    def test_route_message_dispatch_multi_regex_subtasks(self):
-        """Broken dispatch_multi JSON → extract subtasks via regex."""
+    def test_route_message_orchestrate_regex_subtasks(self):
+        """Broken orchestrate JSON → extract subtasks via regex."""
         import asyncio
         async def _test():
             session = ClaudeSession(session_id=None)
-            broken = '{"action": "dispatch_multi", "description": "执行"多步"任务", "subtasks": ["分析代码", "运行测试", "生成报告"]}'
+            broken = '{"action": "orchestrate", "description": "执行"多步"任务", "subtasks": ["分析代码", "运行测试", "生成报告"]}'
             data = {"result": broken}
             stdout = json.dumps(data).encode()
             mock_proc = AsyncMock()
@@ -563,9 +563,26 @@ class TestClaudeSession:
             with patch("supervisor.claude_session.asyncio.create_subprocess_exec", return_value=mock_proc):
                 with patch("supervisor.claude_session.asyncio.wait_for", return_value=(stdout, b"")):
                     result = await session.route_message("多任务", "system", "user")
-                    assert result["action"] == "dispatch_multi"
+                    assert result["action"] == "orchestrate"
                     assert "分析代码" in result["subtasks"]
                     assert "运行测试" in result["subtasks"]
+        asyncio.run(_test())
+
+    def test_route_message_dispatch_multi_compat_becomes_orchestrate(self):
+        """Legacy dispatch_multi from sonnet → converted to orchestrate."""
+        import asyncio
+        async def _test():
+            session = ClaudeSession(session_id=None)
+            legacy = '{"action": "dispatch_multi", "description": "重构", "subtasks": ["A", "B"]}'
+            data = {"result": legacy}
+            stdout = json.dumps(data).encode()
+            mock_proc = AsyncMock()
+            mock_proc.communicate = AsyncMock(return_value=(stdout, b""))
+            mock_proc.returncode = 0
+            with patch("supervisor.claude_session.asyncio.create_subprocess_exec", return_value=mock_proc):
+                with patch("supervisor.claude_session.asyncio.wait_for", return_value=(stdout, b"")):
+                    result = await session.route_message("重构", "system", "user")
+                    assert result["action"] == "orchestrate"
         asyncio.run(_test())
 
     def test_route_message_empty_result(self):
@@ -629,3 +646,101 @@ class TestExtractFieldValue:
         text = '{"action": "reply", "text": "原因：1. 网络 2. 负载"}'
         result = ClaudeSession._extract_field_value(text, "text")
         assert "原因" in result
+
+
+# ── Bug fix: close_all and close action parsing ──
+
+
+class TestCloseActionParsing:
+    """Bug: close_all not in _VALID_ACTIONS → silently falls back to dispatch."""
+
+    def test_close_all_in_valid_actions(self):
+        """close_all must be a valid action for route parsing."""
+        assert "close_all" in ClaudeSession._VALID_ACTIONS
+
+    def test_close_in_valid_actions(self):
+        """close must be a valid action for route parsing."""
+        assert "close" in ClaudeSession._VALID_ACTIONS
+
+    def test_route_message_close_all_json(self):
+        """Sonnet returning close_all JSON should be parsed correctly."""
+        import asyncio
+
+        async def _test():
+            session = ClaudeSession(session_id=None)
+            response_json = '{"action": "close_all"}'
+            data = {"result": response_json}
+            stdout = json.dumps(data).encode()
+            mock_proc = AsyncMock()
+            mock_proc.communicate = AsyncMock(return_value=(stdout, b""))
+            mock_proc.returncode = 0
+            with patch("supervisor.claude_session.asyncio.create_subprocess_exec", return_value=mock_proc):
+                with patch("supervisor.claude_session.asyncio.wait_for", return_value=(stdout, b"")):
+                    result = await session.route_message("全部关闭", "system", "user")
+                    assert result["action"] == "close_all"
+
+        asyncio.run(_test())
+
+    def test_route_message_close_with_task_id(self):
+        """Sonnet returning close JSON with task_id should be parsed correctly."""
+        import asyncio
+
+        async def _test():
+            session = ClaudeSession(session_id=None)
+            response_json = '{"action": "close", "task_id": "8b557777"}'
+            data = {"result": response_json}
+            stdout = json.dumps(data).encode()
+            mock_proc = AsyncMock()
+            mock_proc.communicate = AsyncMock(return_value=(stdout, b""))
+            mock_proc.returncode = 0
+            with patch("supervisor.claude_session.asyncio.create_subprocess_exec", return_value=mock_proc):
+                with patch("supervisor.claude_session.asyncio.wait_for", return_value=(stdout, b"")):
+                    result = await session.route_message("关闭8b557777", "system", "user")
+                    assert result["action"] == "close"
+                    assert result["task_id"] == "8b557777"
+
+        asyncio.run(_test())
+
+    def test_route_message_close_with_task_ids(self):
+        """Sonnet returning close JSON with task_ids array should be parsed."""
+        import asyncio
+
+        async def _test():
+            session = ClaudeSession(session_id=None)
+            response_json = '{"action": "close", "task_ids": ["aaa111", "bbb222"]}'
+            data = {"result": response_json}
+            stdout = json.dumps(data).encode()
+            mock_proc = AsyncMock()
+            mock_proc.communicate = AsyncMock(return_value=(stdout, b""))
+            mock_proc.returncode = 0
+            with patch("supervisor.claude_session.asyncio.create_subprocess_exec", return_value=mock_proc):
+                with patch("supervisor.claude_session.asyncio.wait_for", return_value=(stdout, b"")):
+                    result = await session.route_message("关闭前两个", "system", "user")
+                    assert result["action"] == "close"
+                    assert result["task_ids"] == ["aaa111", "bbb222"]
+
+        asyncio.run(_test())
+
+    def test_regex_extract_close_action(self):
+        """Regex fallback should handle close action with task_id."""
+        session = ClaudeSession(session_id=None)
+        malformed = '{"action": "close", "task_id": "8b557777"}'
+        result = session._try_regex_extract(malformed)
+        assert result is not None
+        assert result["action"] == "close"
+        assert result["task_id"] == "8b557777"
+
+    def test_regex_extract_close_no_id_returns_none(self):
+        """Regex fallback should return None for close without any identifier."""
+        session = ClaudeSession(session_id=None)
+        malformed = '{"action": "close"'  # truncated, no task_id
+        result = session._try_regex_extract(malformed)
+        assert result is None
+
+    def test_regex_extract_close_all_action(self):
+        """Regex fallback should handle close_all action."""
+        session = ClaudeSession(session_id=None)
+        malformed = '{"action": "close_all"}'
+        result = session._try_regex_extract(malformed)
+        assert result is not None
+        assert result["action"] == "close_all"

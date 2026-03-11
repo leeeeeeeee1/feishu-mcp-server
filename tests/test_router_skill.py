@@ -2,6 +2,7 @@
 
 from supervisor.router_skill import (
     build_route_prompt,
+    build_route_user_prompt,
     ROUTING_EXAMPLES,
     ROUTING_RULES,
     SUPERVISOR_IDENTITY,
@@ -35,9 +36,9 @@ class TestBuildRoutePrompt:
         assert '"action"' in prompt
         assert '"text"' in prompt
 
-    def test_contains_dispatch_multi(self):
+    def test_contains_orchestrate(self):
         prompt = build_route_prompt("重构整个项目")
-        assert "dispatch_multi" in prompt
+        assert "orchestrate" in prompt
 
 
 class TestRoutingRules:
@@ -59,8 +60,8 @@ class TestRoutingExamples:
     def test_examples_have_dispatch_cases(self):
         assert "dispatch" in ROUTING_EXAMPLES
 
-    def test_examples_have_dispatch_multi_cases(self):
-        assert "dispatch_multi" in ROUTING_EXAMPLES
+    def test_examples_have_orchestrate_cases(self):
+        assert "orchestrate" in ROUTING_EXAMPLES
 
 
 class TestTaskContext:
@@ -176,3 +177,95 @@ class TestSupervisorIdentity:
 
     def test_identity_mentions_worker(self):
         assert "worker" in SUPERVISOR_IDENTITY
+
+
+class TestReplyContext:
+    """Test that reply_to_task context is injected into the route prompt."""
+
+    def test_no_reply_context_by_default(self):
+        prompt = build_route_prompt("test")
+        assert "## Reply context" not in prompt
+
+    def test_reply_context_included(self):
+        reply_to = {"id": "aabb1122", "description": "分析代码"}
+        prompt = build_route_prompt("好的", reply_to_task=reply_to)
+        assert "## Reply context" in prompt
+        assert "aabb1122" in prompt
+        assert "分析代码" in prompt
+
+    def test_reply_context_mentions_close_and_follow_up(self):
+        reply_to = {"id": "aabb1122", "description": "分析代码"}
+        prompt = build_route_prompt("好的", reply_to_task=reply_to)
+        assert "close" in prompt.lower()
+        assert "follow_up" in prompt.lower()
+
+    def test_reply_context_appears_before_user_message(self):
+        reply_to = {"id": "aabb1122", "description": "分析代码"}
+        prompt = build_route_prompt("好的", reply_to_task=reply_to)
+        reply_pos = prompt.index("## Reply context")
+        msg_pos = prompt.index("<user_message>")
+        assert reply_pos < msg_pos
+
+    def test_reply_context_with_history_and_tasks(self):
+        awaiting = [{"id": "aabb1122", "description": "分析代码"}]
+        reply_to = {"id": "aabb1122", "description": "分析代码"}
+        history = "User: 帮我分析代码"
+        prompt = build_route_prompt(
+            "好的", awaiting_tasks=awaiting,
+            conversation_history=history, reply_to_task=reply_to,
+        )
+        assert "## Reply context" in prompt
+        assert "## Tasks awaiting closure" in prompt
+        assert "## Recent conversation history" in prompt
+
+
+class TestEnrichedTaskContext:
+    """Test that awaiting tasks include result summary and completion time."""
+
+    def test_result_summary_included(self):
+        awaiting = [{"id": "aabb1122", "description": "分析代码",
+                      "result_summary": "Found 3 critical issues"}]
+        prompt = build_route_user_prompt("test", awaiting_tasks=awaiting)
+        assert "Found 3 critical issues" in prompt
+        assert "Result summary" in prompt
+
+    def test_completed_at_included(self):
+        awaiting = [{"id": "aabb1122", "description": "分析代码",
+                      "completed_at": "2m ago"}]
+        prompt = build_route_user_prompt("test", awaiting_tasks=awaiting)
+        assert "2m ago" in prompt
+
+    def test_no_extra_info_when_not_provided(self):
+        awaiting = [{"id": "aabb1122", "description": "分析代码"}]
+        prompt = build_route_user_prompt("test", awaiting_tasks=awaiting)
+        assert "Result summary" not in prompt
+        assert "completed" not in prompt.lower() or "completed" in ROUTING_RULES.lower()
+
+
+class TestTechnicalCloseDisambiguation:
+    """Test that routing rules and examples distinguish task close from technical operations."""
+
+    def test_rules_mention_technical_operations(self):
+        assert "数据库连接" in ROUTING_RULES or "technical" in ROUTING_RULES.lower()
+
+    def test_examples_have_technical_dispatch_cases(self):
+        """Examples should show technical close operations dispatched, not closed."""
+        assert "数据库连接" in ROUTING_EXAMPLES or "nginx" in ROUTING_EXAMPLES
+
+    def test_rules_distinguish_close_from_dispatch(self):
+        """Rules must explicitly mention distinguishing task closure from technical ops."""
+        assert "dispatch" in ROUTING_RULES
+        assert "TECHNICAL" in ROUTING_RULES or "technical" in ROUTING_RULES.lower()
+
+
+class TestAcknowledgementCloseExamples:
+    """Test that examples include short acknowledgements → close patterns."""
+
+    def test_ok_close_example(self):
+        assert '"ok"' in ROUTING_EXAMPLES.lower() or '"好的"' in ROUTING_EXAMPLES
+
+    def test_thumbs_up_close_example(self):
+        assert "👍" in ROUTING_EXAMPLES
+
+    def test_shoudao_close_example(self):
+        assert "收到" in ROUTING_EXAMPLES

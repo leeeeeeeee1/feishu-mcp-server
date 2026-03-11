@@ -41,17 +41,18 @@ def _looks_like_needs_input(text: str) -> bool:
     return any(phrase in lower for phrase in _INPUT_PHRASES)
 
 
-# Phrases that indicate user acknowledges / wants to close
+import re as _re  # used by _SAFE_ID_RE below
+
+
+# Close intent detection — used by main.py for reply-based quick close (Step 0).
+# These provide a fast local fallback for Feishu thread replies where Sonnet
+# routing would add unnecessary latency for obvious acknowledgements.
 _CLOSE_PHRASES = (
     "好的", "收到", "ok", "谢谢", "thanks", "可以了", "没问题",
     "完成", "done", "lgtm", "不用了", "就这样", "👍", "thank you",
 )
 
-
 _CLOSE_PHRASES_SET = frozenset(p.lower() for p in _CLOSE_PHRASES)
-
-
-import re as _re
 
 # Technical nouns — if these appear near 关闭/关掉/结束, it's NOT task closure
 _TECHNICAL_NOUNS = r"连接|端口|服务|进程|窗口|文件|通道|线程|循环|socket|server|session|db|数据库|nginx|redis"
@@ -67,10 +68,10 @@ _CLOSE_FALSE_POSITIVES = _re.compile(
 )
 
 _CLOSE_INTENT_PATTERNS = [
-    _re.compile(r"关闭(了|吧|这个|那个)"),  # 关闭了/关闭吧/关闭这个/关闭那个
+    _re.compile(r"关闭(了|吧|这个|那个)"),
     _re.compile(r"关了"),
     _re.compile(r"关掉"),
-    _re.compile(r"结束(吧|了|掉|这个|那个|任务)"),  # anchored: require suffix
+    _re.compile(r"结束(吧|了|掉|这个|那个|任务)"),
     _re.compile(r"不用了"),
     _re.compile(r"完事了"),
     _re.compile(r"可以关了"),
@@ -84,6 +85,7 @@ def _contains_close_intent(text: str) -> bool:
 
     Unlike _looks_like_close (≤10 char exact match), this works on any
     length text. Conservative: excludes technical phrases like "关闭连接".
+    Note: the false-positive guard only covers post-verb position.
     """
     if not text or not text.strip():
         return False
@@ -95,21 +97,16 @@ def _contains_close_intent(text: str) -> bool:
 def _looks_like_close(text: str) -> bool:
     """Heuristic: short acknowledgement → close intent, not follow-up.
 
-    Uses exact match after normalization to avoid false positives like
-    "not ok" or "I am done".
+    Uses exact match after normalization to avoid false positives.
     """
     stripped = text.strip()
     if not stripped:
         return False
-    # Questions are never close intent
     if "?" in stripped or "？" in stripped or "吗" in stripped:
         return False
-    # Strip trailing punctuation for matching
     normalized = stripped.lower().rstrip("。.!！~，,").strip()
-    # Short messages only (≤10 unicode chars)
     if len(normalized) > 10:
         return False
-    # Exact match against known close phrases
     return normalized in _CLOSE_PHRASES_SET
 
 
@@ -266,13 +263,21 @@ def _clear_checkpoint(task_id: str) -> None:
         logger.warning("Failed to clear checkpoint for %s: %s", task_id[:8], e)
 
 
+_ACTIVE_PROCESS_STATUSES = frozenset(("running", "follow_up", "learning"))
+"""States that imply an active subprocess was running at crash time.
+These processes are lost on restart and need recovery.
+Other states (pending, waiting_for_input, review, done, awaiting_closure)
+have no live subprocess and are preserved unchanged on restart."""
+
+
 def _load_tasks() -> None:
     """Load tasks from disk on startup.
 
     Recovery strategy for tasks that were active when supervisor crashed:
-    - pending (never started): keep as pending — can be re-dispatched
-    - running with progress: mark as interrupted — resumable via recover_task()
-    - running without progress: mark as interrupted — retryable
+    - pending: keep as pending — can be re-dispatched
+    - running/follow_up/learning: mark as interrupted — resumable via /recover
+    - waiting_for_input/review/done/awaiting_closure: preserved (no live process)
+    - completed/cancelled: preserved if <24h old, pruned otherwise
     Checkpoint data (if available) is merged to preserve progress information.
     """
     # Clean up orphaned .tmp file from interrupted save
@@ -310,11 +315,12 @@ def _load_tasks() -> None:
             if task.status == "pending":
                 # Never started — keep as pending (safe to re-queue)
                 pass
-            elif task.status == "running":
+            elif task.status in _ACTIVE_PROCESS_STATUSES:
                 # Was executing — mark as interrupted, merge checkpoint data
+                old_status = task.status
                 merge_kwargs: dict = {
                     "status": "interrupted",
-                    "error": "Supervisor restarted while task was in progress",
+                    "error": f"Supervisor restarted while task was {old_status}",
                     "finished_at": time.time(),
                 }
 
@@ -337,8 +343,8 @@ def _load_tasks() -> None:
                 task = dc_replace(task, **merge_kwargs)
                 interrupted_count += 1
                 logger.warning(
-                    "Task %s: running → interrupted (session=%s, steps=%d)",
-                    tid[:8], bool(task.session_id), len(task.steps_completed),
+                    "Task %s: %s → interrupted (session=%s, steps=%d)",
+                    tid[:8], old_status, bool(task.session_id), len(task.steps_completed),
                 )
 
             _tasks[tid] = task
@@ -905,8 +911,8 @@ def close_task(task_id: str) -> str:
             f"Task {task_id[:8]} cannot be closed (status={task.status})"
         )
 
-    _set_status(task, "completed")
     task.finished_at = time.time()
+    _set_status(task, "completed")
     return f"Task {task_id[:8]} closed."
 
 

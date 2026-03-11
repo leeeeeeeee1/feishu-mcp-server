@@ -12,19 +12,18 @@ Usage:
 """
 
 import asyncio
-import json
 import logging
-import os
 import re
 import signal
-import sys
 import threading
 import time
 from typing import Optional
 
-from .claude_session import ClaudeSession, StreamEvent
+from collections import deque
+
+from .claude_session import ClaudeSession
 from .feishu_gateway import FeishuGateway
-from .router_skill import build_route_prompt, build_route_system_prompt, build_route_user_prompt
+from .router_skill import build_route_system_prompt, build_route_user_prompt
 from .task_dispatcher import _looks_like_close, _contains_close_intent
 
 logger = logging.getLogger(__name__)
@@ -63,9 +62,10 @@ class Supervisor:
         self.claude = ClaudeSession(system_prompt=SUPERVISOR_SYSTEM_PROMPT)
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown = asyncio.Event()
-        self._conversation_history: list[dict[str, str]] = []
+        self._conversation_history: deque[dict[str, str]] = deque(maxlen=self.MAX_HISTORY)
         self._read_messages: dict[str, float] = {}  # message_id -> timestamp, ordered by insertion
         self._message_task_map: dict[str, str] = {}  # feishu_message_id → task_id
+        self._current_chat_id: Optional[str] = None
 
         # Monitors
         try:
@@ -111,15 +111,19 @@ class Supervisor:
             "/close": self._cmd_close,
             "/followup": self._cmd_followup,
             "/reply": self._cmd_reply,
+            "/recover": self._cmd_recover,
             "/help": self._cmd_help,
         }
 
         handler = handlers.get(command)
         if handler:
             try:
+                self._current_chat_id = chat_id
                 result = handler(arg)
             except Exception as e:
                 result = f"Error: {e}"
+            finally:
+                self._current_chat_id = None
             self.gateway.reply_message(message_id, result)
             self._record_message("user", cmd)
             self._record_message("assistant", result[:500])
@@ -271,6 +275,88 @@ class Supervisor:
                 return f"Error: {e}"
         return "Event loop not available."
 
+    def _cmd_recover(self, arg: str) -> str:
+        """Recover interrupted tasks after supervisor restart."""
+        if not self._task_dispatcher:
+            return "Task dispatcher not available."
+
+        _VALID_MODES = ("resume", "retry", "dismiss")
+
+        # No argument: list interrupted tasks
+        if not arg.strip():
+            interrupted = self._task_dispatcher.list_interrupted()
+            if not interrupted:
+                return "No interrupted tasks to recover."
+            lines = ["Interrupted tasks (recoverable after restart):\n"]
+            for t in interrupted:
+                resumable = "resumable" if t.session_id else "retryable"
+                lines.append(
+                    f"  [{t.id[:8]}] {t.description or t.prompt[:60]} "
+                    f"({resumable}, {len(t.steps_completed)} steps)"
+                )
+            lines.append(
+                "\nUsage: /recover <task_id> [resume|retry|dismiss]"
+            )
+            return "\n".join(lines)
+
+        # Parse task_id and optional mode
+        parts = arg.strip().split(maxsplit=1)
+        task_id_prefix = parts[0]
+        mode = parts[1].strip().lower() if len(parts) > 1 else "resume"
+
+        if mode not in _VALID_MODES:
+            return (
+                f"Invalid mode '{mode}'. "
+                f"Valid modes: resume, retry, dismiss"
+            )
+
+        task = self._find_task_by_prefix(task_id_prefix)
+        if isinstance(task, str):
+            return task  # error message
+
+        if task.status != "interrupted":
+            return (
+                f"Task {task.id[:8]} is not interrupted "
+                f"(status={task.status}). Only interrupted tasks can be recovered."
+            )
+
+        if not self._loop:
+            return "Event loop not available."
+
+        # Wire notification callback so user gets result when recovered task completes
+        chat_id = getattr(self, "_current_chat_id", None)
+
+        def on_complete(finished_task, _cid=chat_id):
+            if _cid:
+                self._notify_task_result(finished_task, _cid)
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._task_dispatcher.recover_task(
+                    task.id, mode=mode, on_complete=on_complete,
+                ),
+                self._loop,
+            )
+            new_task = future.result(timeout=60)
+        except Exception as e:
+            return f"Recovery failed: {e}"
+
+        if mode == "dismiss":
+            return f"Task {task.id[:8]} dismissed (marked as failed)."
+
+        if new_task is None:
+            return f"Task {task.id[:8]} recovered via {mode} but no new task was created."
+
+        # Surface resume→retry fallback when no session was available
+        actual_mode = mode
+        if mode == "resume" and not task.session_id:
+            actual_mode = "retry (no session available for resume)"
+
+        return (
+            f"Task {task.id[:8]} recovered via {actual_mode} "
+            f"-> new task {new_task.id[:8]} dispatched."
+        )
+
     def _cmd_help(self, _arg: str) -> str:
         return (
             "Supervisor Hub Commands:\n"
@@ -284,6 +370,7 @@ class Supervisor:
             "/close all       — Close all awaiting_closure tasks\n"
             "/followup <id> <text> — Ask follow-up on a completed task\n"
             "/reply <id> <text>    — Reply to a task waiting for input\n"
+            "/recover [id] [mode]  — Recover interrupted tasks after restart\n"
             "/skip <id>       — Skip review for a task\n"
             "/help            — This message\n\n"
             "Message routing (sonnet auto-classifies):\n"
@@ -348,10 +435,20 @@ class Supervisor:
             return {"awaiting": [], "active": []}
 
         tasks = self._task_dispatcher.list_tasks()
-        awaiting = [
-            {"id": t.id[:8], "description": t.description or t.prompt[:60]}
-            for t in tasks if t.status == "awaiting_closure"
-        ]
+        awaiting = []
+        for t in tasks:
+            if t.status != "awaiting_closure":
+                continue
+            info: dict = {"id": t.id[:8], "description": t.description or t.prompt[:60]}
+            if t.finished_at:
+                elapsed = int(time.time() - t.finished_at)
+                if elapsed < 60:
+                    info["completed_at"] = f"{elapsed}s ago"
+                else:
+                    info["completed_at"] = f"{elapsed // 60}m ago"
+            if t.result:
+                info["result_summary"] = t.result[:120].replace("\n", " ")
+            awaiting.append(info)
         active = []
         for t in tasks:
             if t.status in self._TERMINAL_STATUSES or t.status == "awaiting_closure":
@@ -382,19 +479,21 @@ class Supervisor:
     ):
         """Route incoming message via sonnet.
 
-        0. Reply to task result message (parent_id match) → direct follow-up
-        1. Explicit task ID in message → direct follow-up
-        2. Sonnet classifies (with awaiting task context) → reply/dispatch/follow_up
+        All user messages are classified by Sonnet (no hardcoded pattern matching).
+        Reply context (parent_id → task mapping) enriches the Sonnet prompt to
+        help it distinguish close vs follow_up intent.
         """
-        # ── Step 0: Reply-based follow-up or close (parent_id → task mapping)
+        # ── Step 0: Reply-based quick close or context enrichment
+        reply_to_task: dict | None = None
         if parent_id and parent_id in self._message_task_map:
             task_id = self._message_task_map[parent_id]
             if self._task_dispatcher:
                 task = self._task_dispatcher.get_task(task_id)
                 if task and task.status == "awaiting_closure":
-                    self._record_message("user", text)
-                    # Short acknowledgement → close task
-                    if _looks_like_close(text):
+                    # Fast local close for obvious acknowledgements/close intent
+                    # (avoids Sonnet API round-trip for simple replies)
+                    if _looks_like_close(text) or _contains_close_intent(text):
+                        self._record_message("user", text)
                         logger.info(
                             "Reply-based close: parent=%s → task %s",
                             parent_id, task.id[:8],
@@ -408,38 +507,20 @@ class Supervisor:
                         self.gateway.reply_message(message_id, reply_text)
                         self._record_message("assistant", reply_text)
                         return
-                    # Otherwise → follow-up
+                    # Non-close reply: enrich Sonnet context with task info
+                    reply_to_task = {
+                        "id": task.id[:8],
+                        "description": task.description or task.prompt[:60],
+                    }
                     logger.info(
-                        "Reply-based follow-up: parent=%s → task %s",
+                        "Reply context: parent=%s → task %s",
                         parent_id, task.id[:8],
                     )
-                    await self._handle_follow_up(task, text, chat_id, message_id)
-                    self._record_message("assistant", f"[follow-up sent to {task.id[:8]}]")
-                    return
 
-        # ── Step 1: Explicit task ID → direct follow-up (awaiting_closure only)
-        matched_task_id = self._extract_task_id_from_text(text)
-        if matched_task_id:
-            task = self._task_dispatcher.get_task(matched_task_id)
-            if task and task.status == "awaiting_closure":
-                logger.info(
-                    "Explicit task ID match, follow-up to %s: %s",
-                    task.id[:8], text[:60],
-                )
-                self._record_message("user", text)
-                await self._handle_follow_up(task, text, chat_id, message_id)
-                self._record_message("assistant", f"[follow-up sent to {task.id[:8]}]")
-                return
-            elif task:
-                logger.info(
-                    "Explicit task ID match (%s) but status=%s, passing to sonnet",
-                    task.id[:8], task.status,
-                )
-
-        # ── Step 2: Record user message
+        # ── Step 1: Record user message
         self._record_message("user", text)
 
-        # ── Step 3: Sonnet classify + respond (with task context)
+        # ── Step 2: Sonnet classify + respond (with task context + reply context)
         tasks_ctx = self._get_tasks_context()
         system_prompt = build_route_system_prompt()
         user_prompt = build_route_user_prompt(
@@ -447,6 +528,7 @@ class Supervisor:
             awaiting_tasks=tasks_ctx["awaiting"] or None,
             active_tasks=tasks_ctx["active"] or None,
             conversation_history=self._get_history_text(),
+            reply_to_task=reply_to_task,
         )
         result = await self.claude.route_message(text, system_prompt, user_prompt)
         action = result.get("action", "dispatch")
@@ -468,11 +550,11 @@ class Supervisor:
         elif action == "follow_up":
             await self._handle_sonnet_follow_up(result, text, chat_id, message_id)
 
-        elif action == "dispatch_multi":
+        elif action in ("orchestrate", "dispatch_multi"):
             subtasks = result.get("subtasks", [])
             description = result.get("description", text[:80])
             if subtasks:
-                await self._handle_dispatch_multi(
+                await self._handle_orchestrate(
                     text, subtasks, chat_id, message_id, description,
                 )
             else:
@@ -487,10 +569,8 @@ class Supervisor:
     # ── Conversation History ──
 
     def _record_message(self, role: str, text: str) -> None:
-        """Append a message to conversation history, capped at MAX_HISTORY."""
+        """Append a message to conversation history (auto-capped by deque maxlen)."""
         self._conversation_history.append({"role": role, "text": text})
-        if len(self._conversation_history) > self.MAX_HISTORY:
-            self._conversation_history = self._conversation_history[-self.MAX_HISTORY:]
 
     def _get_history_text(self) -> str:
         """Format recent conversation history as text for worker context."""
@@ -513,10 +593,10 @@ class Supervisor:
             Enriched prompt string with context for the worker.
         """
         parts = [
-            f"You are a worker agent in a development container.",
+            "You are a worker agent in a development container.",
             f"Task: {description}",
             f"User's original request: {text}",
-            f"Working directory: /workspace",
+            "Working directory: /workspace",
         ]
 
         history = self._get_history_text()
@@ -559,11 +639,73 @@ class Supervisor:
         )
         logger.info("Dispatched: %s -> %s", task.id[:8], description)
 
-    async def _handle_dispatch_multi(
+    def _build_orchestrator_prompt(
+        self, text: str, description: str, subtasks: list[str],
+    ) -> str:
+        """Build a prompt for the orchestrator worker with subagent instructions.
+
+        The orchestrator is a single worker that coordinates multiple subagents
+        via Claude's Agent tool, sharing context and managing dependencies.
+
+        Args:
+            text: The original user message.
+            description: Sonnet-generated task description.
+            subtasks: List of subtask descriptions to coordinate.
+
+        Returns:
+            Enriched prompt string with orchestrator instructions.
+        """
+        subtask_list = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(subtasks))
+
+        parts = [
+            "You are an orchestrator worker in a development container.",
+            f"Task: {description}",
+            f"User's original request: {text}",
+            "Working directory: /workspace",
+            "",
+            "## Orchestration Instructions",
+            "",
+            "You must coordinate the following subtasks using the Agent tool.",
+            "Launch subagents IN PARALLEL for independent subtasks to maximize efficiency.",
+            "Each subagent shares the same codebase but works independently.",
+            "",
+            f"## Subtasks to coordinate\n{subtask_list}",
+            "",
+            "## How to orchestrate",
+            "1. Launch parallel Agent subagents for independent subtasks",
+            "2. Wait for results and check for conflicts or dependencies",
+            "3. If subtasks have dependencies, run them sequentially",
+            "4. Synthesize all results into a final summary for the user",
+            "5. Handle any merge conflicts or inconsistencies between subagent outputs",
+            "",
+            "## Important",
+            "- Use the Agent tool to launch subagents, NOT direct tool calls for each subtask",
+            "- Subagents can share context — pass relevant info between them",
+            "- If a subagent fails, decide whether to retry or proceed with remaining subtasks",
+            "- Provide a unified final summary when all subtasks complete",
+        ]
+
+        history = self._get_history_text()
+        if history:
+            parts.append(f"\n## Recent conversation history\n{history}")
+
+        parts.append(
+            "\nExecute this task thoroughly. Be concise in your response.\n"
+            "Answer in the same language as the user's request."
+        )
+
+        return "\n".join(parts)
+
+    async def _handle_orchestrate(
         self, text: str, subtasks: list[str], chat_id: str,
         message_id: str, description: str,
     ):
-        """Decompose into parallel sub-tasks."""
+        """Dispatch a single orchestrator task that coordinates subagents.
+
+        Unlike the old dispatch_multi (N independent tasks), this creates ONE
+        task whose worker uses the Agent tool to launch and coordinate subagents.
+        Benefits: shared context, inter-agent communication, conflict handling.
+        """
         if not self._task_dispatcher:
             self.gateway.reply_message(message_id, "Task dispatcher not available.")
             return
@@ -571,28 +713,27 @@ class Supervisor:
         subtask_list = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(subtasks))
         self.gateway.reply_message(
             message_id,
-            f"📋 复杂任务已拆解\n总述: {description}\n\n子任务:\n{subtask_list}\n\n并行调度中...",
+            f"📋 编排任务已调度\n总述: {description}\n\n子任务:\n{subtask_list}\n\n"
+            f"单一 orchestrator 将协调 {len(subtasks)} 个 subagent 并行执行",
         )
 
-        for sub_prompt in subtasks:
-            enriched_prompt = (
-                f"This is a sub-task of a larger request: \"{text[:200]}\"\n\n"
-                f"Your specific sub-task: {sub_prompt}\n\n"
-                f"Focus only on this sub-task. Be thorough and concise."
-            )
+        enriched_prompt = self._build_orchestrator_prompt(text, description, subtasks)
 
-            def on_complete(task, _cid=chat_id):
-                self._notify_task_result(task, _cid)
+        def on_complete(task):
+            self._notify_task_result(task, chat_id)
 
-            task = await self._task_dispatcher.dispatch(
-                prompt=enriched_prompt,
-                cwd="/workspace",
-                task_type="oneshot",
-                chat_id=chat_id,
-                on_complete=on_complete,
-                description=sub_prompt[:80],
-            )
-            logger.info("Sub-task dispatched: %s -> %s", task.id[:8], sub_prompt[:60])
+        task = await self._task_dispatcher.dispatch(
+            prompt=enriched_prompt,
+            cwd="/workspace",
+            task_type="oneshot",
+            chat_id=chat_id,
+            on_complete=on_complete,
+            description=f"[orchestrator] {description}",
+        )
+        logger.info(
+            "Orchestrator dispatched: %s -> %s (%d subtasks)",
+            task.id[:8], description, len(subtasks),
+        )
 
     async def _handle_follow_up(
         self, task, text: str, chat_id: str, message_id: str
@@ -642,18 +783,8 @@ class Supervisor:
 
         task = matching[0]
 
-        # Smart close fallback: if original user text contains close intent,
-        # close the task instead of following up (sonnet misclassification)
-        if _contains_close_intent(text):
-            logger.info(
-                "Smart close fallback: follow_up but text '%s' has close intent → closing %s",
-                text[:60], task.id[:8],
-            )
-            await self._handle_sonnet_close(
-                {"action": "close", "task_id": task_id_prefix}, chat_id, message_id,
-            )
-            return
-
+        # Trust Sonnet's classification — no hardcoded fallback overrides.
+        # The routing prompt includes clear disambiguation rules for close vs follow_up.
         follow_up_text = result.get("text", text)
         await self._handle_follow_up(task, follow_up_text, chat_id, message_id)
 
