@@ -1071,6 +1071,10 @@ class TestSonnetBatchClose:
             sup._task_dispatcher.close_tasks.assert_called_once_with(
                 [mock_t1.id, mock_t2.id]
             )
+            sup.gateway.reply_message.assert_called()
+            reply = sup.gateway.reply_message.call_args[0][1]
+            assert "aabb1122" in reply
+            assert "ccdd3344" in reply
 
         asyncio.run(_test())
 

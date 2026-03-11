@@ -164,7 +164,8 @@ class TestBatchCloseAction:
 
     def test_close_all_few_shot_with_multiple_tasks(self):
         """Few-shot examples should show close_all with multiple awaiting tasks."""
-        assert "全部关" in ROUTING_EXAMPLES or "都关" in ROUTING_EXAMPLES or "all" in ROUTING_EXAMPLES.lower()
+        assert '"close_all"' in ROUTING_EXAMPLES
+        assert "全部关" in ROUTING_EXAMPLES or "都关" in ROUTING_EXAMPLES
 
 
 class TestSupervisorIdentity:
