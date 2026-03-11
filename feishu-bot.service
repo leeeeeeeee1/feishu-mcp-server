@@ -1,0 +1,24 @@
+[Unit]
+Description=Feishu MCP Bot - Claude Code Forwarding
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m feishu_mcp.bot
+WorkingDirectory=/workspace/feishu-mcp-server
+Environment=FEISHU_APP_ID=cli_a93b9f3cabf8dcef
+Environment=FEISHU_APP_SECRET=uJLhFsa09Fwj7M0WEpOLQbEngjap55GI
+Environment=PYTHONPATH=/workspace/feishu-mcp-server/src
+
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=feishu-bot
+
+[Install]
+WantedBy=multi-user.target
