@@ -51,15 +51,21 @@ Decide the action for this user message:
 - User is asking about, commenting on, or following up on a previous task result
 - Include the task_id field matching the task being referenced
 
-### action = "close" (close a completed task)
+### action = "close" (close one or more completed tasks)
 - User expresses intent to close/finish/dismiss a task (关闭, 结束, 不用了, 完事了, 可以关了, 关掉, 关了, close, done with it)
 - Patterns: "XXX关闭了", "XXX那个关了", "把XXX关掉", "XXX可以关了", "XXX不用了", "关闭XXX"
 - IMPORTANT: If the user message contains a close keyword (关闭/关了/关掉/结束/不用了/完事了) referring to a task, use "close" NOT "follow_up"
 - ONLY available when there are tasks in awaiting_closure state (listed below)
-- Must match to a specific awaiting_closure task via task_id
+- Single task: match to a specific task via task_id → {"action": "close", "task_id": "<8-char id>"}
+- Multiple specific tasks: use task_ids array → {"action": "close", "task_ids": ["<id1>", "<id2>"]}
 - If only one task is awaiting closure → auto-match that task
 - If multiple tasks → match based on context (recent conversation, user reference, task description keywords)
-- Return {"action": "close", "task_id": "<8-char id>"}
+
+### action = "close_all" (close ALL awaiting tasks at once)
+- User explicitly wants to close ALL waiting tasks, not just one or some
+- Patterns: "全部关了", "都关了", "把这些都关掉", "全部关闭", "全关了", "close all", "关闭所有任务"
+- Return {"action": "close_all"}
+- ONLY use when user clearly means ALL tasks, not a specific subset
 
 ## Critical Rules
 1. "总结/分析 + specific project/codebase" → dispatch (needs file access)
@@ -126,7 +132,19 @@ User: "检查系统日志那个关闭了" (when tasks [aabb1122] "分析代码" 
 → {"action": "close", "task_id": "ccdd3344"}
 
 User: "分析代码那个结束吧" (when task [aabb1122] "分析代码" is awaiting closure)
-→ {"action": "close", "task_id": "aabb1122"}"""
+→ {"action": "close", "task_id": "aabb1122"}
+
+User: "把前两个关了" (when tasks [aabb1122] "分析代码", [ccdd3344] "检查日志", [eeff5566] "跑测试" are awaiting closure)
+→ {"action": "close", "task_ids": ["aabb1122", "ccdd3344"]}
+
+User: "全部关了" (when tasks [aabb1122] and [ccdd3344] are awaiting closure)
+→ {"action": "close_all"}
+
+User: "把这些任务都关掉" (when multiple tasks are awaiting closure)
+→ {"action": "close_all"}
+
+User: "close all" (when tasks are awaiting closure)
+→ {"action": "close_all"}"""
 
 # ── Prompt Templates ──
 
@@ -142,7 +160,9 @@ Reply with ONLY a JSON object (no markdown, no code blocks):
 - If dispatching single task: {{"action": "dispatch", "description": "short task description"}}
 - If decomposing into sub-tasks: {{"action": "dispatch_multi", "description": "overall description", "subtasks": ["sub1", "sub2", ...]}}
 - If following up on an existing task: {{"action": "follow_up", "task_id": "<8-char id>", "text": "the follow-up question"}}
-- If closing a completed task: {{"action": "close", "task_id": "<8-char id>"}}"""
+- If closing a completed task: {{"action": "close", "task_id": "<8-char id>"}}
+- If closing multiple specific tasks: {{"action": "close", "task_ids": ["<id1>", "<id2>"]}}
+- If closing ALL awaiting tasks: {{"action": "close_all"}}"""
 
 # User prompt: dynamic part (tasks + history + message) — changes per request
 _ROUTE_USER = """{awaiting_context}{history_context}Classify this user message and respond with a JSON object.

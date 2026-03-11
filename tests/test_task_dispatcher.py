@@ -22,6 +22,7 @@ from supervisor.task_dispatcher import (
     stop_daemon,
     cancel_task,
     close_task,
+    close_tasks,
     follow_up_async,
     get_awaiting_closure,
     get_tasks_text,
@@ -683,6 +684,95 @@ class TestCloseTask:
             assert False, "Should have raised"
         except ValueError:
             pass
+
+
+# ── Batch close tasks ──
+
+
+class TestCloseTasks:
+    def setup_method(self):
+        _reset()
+
+    def test_close_multiple_tasks(self):
+        """close_tasks() closes multiple awaiting_closure tasks at once."""
+        async def _test():
+            with patch("supervisor.task_dispatcher.asyncio.create_subprocess_exec",
+                       return_value=_make_proc_mock(_json_result("Done"))):
+                t1 = await dispatch("task1")
+                t2 = await dispatch("task2")
+                t3 = await dispatch("task3")
+                await asyncio.sleep(0.1)
+                assert t1.status == "awaiting_closure"
+                assert t2.status == "awaiting_closure"
+                assert t3.status == "awaiting_closure"
+
+                results = close_tasks([t1.id, t2.id, t3.id])
+                assert len(results) == 3
+                assert all("closed" in r for r in results)
+                assert t1.status == "completed"
+                assert t2.status == "completed"
+                assert t3.status == "completed"
+
+        asyncio.run(_test())
+
+    def test_close_tasks_partial_failure(self):
+        """close_tasks() reports per-task errors without stopping batch."""
+        async def _test():
+            with patch("supervisor.task_dispatcher.asyncio.create_subprocess_exec",
+                       return_value=_make_proc_mock(_json_result("Done"))):
+                t1 = await dispatch("task1")
+                await asyncio.sleep(0.1)
+                assert t1.status == "awaiting_closure"
+
+                results = close_tasks([t1.id, "nonexistent-id"])
+                assert len(results) == 2
+                assert "closed" in results[0]
+                assert "Error" in results[1] or "Unknown" in results[1]
+                assert t1.status == "completed"
+
+        asyncio.run(_test())
+
+    def test_close_tasks_empty_list(self):
+        """close_tasks() with empty list returns empty results."""
+        results = close_tasks([])
+        assert results == []
+
+    def test_close_tasks_wrong_status_included(self):
+        """close_tasks() skips tasks that cannot be closed, reports error."""
+        async def _test():
+            with patch("supervisor.task_dispatcher.asyncio.create_subprocess_exec",
+                       return_value=_make_proc_mock(_json_result("Which file?"))):
+                t1 = await dispatch("task1")
+                await asyncio.sleep(0.1)
+                assert t1.status == "waiting_for_input"
+
+                results = close_tasks([t1.id])
+                assert len(results) == 1
+                assert "cannot be closed" in results[0]
+
+        asyncio.run(_test())
+
+    def test_close_tasks_mixed_statuses(self):
+        """close_tasks() handles mix of closable and non-closable tasks."""
+        async def _test():
+            proc_ok = _make_proc_mock(_json_result("Done"))
+            proc_input = _make_proc_mock(_json_result("Which file?"))
+            with patch("supervisor.task_dispatcher.asyncio.create_subprocess_exec",
+                       side_effect=[proc_ok, proc_input]):
+                t1 = await dispatch("task1")
+                t2 = await dispatch("task2")
+                await asyncio.sleep(0.1)
+                assert t1.status == "awaiting_closure"
+                assert t2.status == "waiting_for_input"
+
+                results = close_tasks([t1.id, t2.id])
+                assert len(results) == 2
+                assert "closed" in results[0]
+                assert "cannot be closed" in results[1]
+                assert t1.status == "completed"
+                assert t2.status == "waiting_for_input"
+
+        asyncio.run(_test())
 
 
 # ── Get awaiting closure ──

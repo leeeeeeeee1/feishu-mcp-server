@@ -149,6 +149,24 @@ class TestCloseAction:
         assert 'tell them to use /close' not in ROUTING_RULES
 
 
+class TestBatchCloseAction:
+    """Test that batch close (close_all) is defined in routing rules and examples."""
+
+    def test_rules_mention_close_all(self):
+        assert "close_all" in ROUTING_RULES
+
+    def test_examples_have_close_all_case(self):
+        assert '"close_all"' in ROUTING_EXAMPLES
+
+    def test_close_all_format_in_prompt(self):
+        prompt = build_route_prompt("把这些任务都关了")
+        assert '"close_all"' in prompt
+
+    def test_close_all_few_shot_with_multiple_tasks(self):
+        """Few-shot examples should show close_all with multiple awaiting tasks."""
+        assert "全部关" in ROUTING_EXAMPLES or "都关" in ROUTING_EXAMPLES or "all" in ROUTING_EXAMPLES.lower()
+
+
 class TestSupervisorIdentity:
     """Test the identity string for sonnet's reply generation."""
 
