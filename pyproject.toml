@@ -25,7 +25,7 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/anthropics/feishu-mcp-server"
+Repository = "https://github.com/leeeeeeeee1/feishu-mcp-server"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/feishu_mcp", "src/supervisor"]
