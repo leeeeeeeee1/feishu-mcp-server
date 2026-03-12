@@ -300,7 +300,7 @@ class ClaudeSession:
         Returns a dict with:
             - {"action": "reply", "text": "..."} for direct responses
             - {"action": "dispatch", "description": "..."} for single tasks
-            - {"action": "dispatch_multi", "description": "...", "subtasks": [...]}
+            - {"action": "orchestrate", "description": "...", "subtasks": [...]}
             - {"action": "follow_up", "task_id": "...", "text": "..."} for task follow-ups
 
         Falls back to action=dispatch on any error (safe default).
@@ -583,10 +583,11 @@ class ClaudeSession:
         """Normalize legacy action names to current ones.
 
         dispatch_multi → orchestrate (backward compatibility).
+        Returns a new dict to avoid mutating the input.
         """
         if parsed.get("action") == "dispatch_multi":
             return {**parsed, "action": "orchestrate"}
-        return parsed
+        return dict(parsed)
 
     @staticmethod
     def _strip_markdown_wrapper(text: str) -> str:

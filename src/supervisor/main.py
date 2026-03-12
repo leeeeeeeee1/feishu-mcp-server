@@ -550,7 +550,7 @@ class Supervisor:
         elif action == "follow_up":
             await self._handle_sonnet_follow_up(result, text, chat_id, message_id)
 
-        elif action in ("orchestrate", "dispatch_multi"):
+        elif action in ("orchestrate", "dispatch_multi"):  # dispatch_multi: compat (normalised by route_message)
             subtasks = result.get("subtasks", [])
             description = result.get("description", text[:80])
             if subtasks:
