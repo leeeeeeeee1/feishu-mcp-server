@@ -62,9 +62,14 @@ class Supervisor:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown = asyncio.Event()
         self._conversation_history: deque[dict[str, str]] = deque(maxlen=self.MAX_HISTORY)
+        self._monitor_buffer: list[dict[str, str]] = []  # incremental buffer for monitor
+        self._monitor_buffer_lock = threading.Lock()
         self._read_messages: dict[str, float] = {}  # message_id -> timestamp, ordered by insertion
         self._message_task_map: dict[str, str] = {}  # feishu_message_id → task_id
         self._current_chat_id: Optional[str] = None
+        # Two-step monitor fix confirmation state.
+        # THREADING: only read/written on the asyncio event loop thread.
+        self._pending_monitor_fix: Optional[dict] = None
 
         # Monitors
         try:
@@ -160,6 +165,14 @@ class Supervisor:
         Reply context (parent_id → task mapping) enriches the Sonnet prompt to
         help it distinguish close vs follow_up intent.
         """
+        # ── Step -1: Check pending monitor fix confirmation ──
+        if self._pending_monitor_fix:
+            handled = await self._handle_monitor_fix_response(
+                text, chat_id, message_id,
+            )
+            if handled:
+                return
+
         # ── Step 0: Reply-based quick close or context enrichment
         reply_to_task: dict | None = None
         if parent_id and parent_id in self._message_task_map:
@@ -251,7 +264,17 @@ class Supervisor:
 
     def _record_message(self, role: str, text: str) -> None:
         """Append a message to conversation history (auto-capped by deque maxlen)."""
-        self._conversation_history.append({"role": role, "text": text})
+        entry = {"role": role, "text": text}
+        self._conversation_history.append(entry)
+        with self._monitor_buffer_lock:
+            self._monitor_buffer.append(entry)
+
+    def _flush_monitor_buffer(self) -> list[dict[str, str]]:
+        """Take and clear the monitor buffer. Thread-safe atomic snapshot."""
+        with self._monitor_buffer_lock:
+            buf = self._monitor_buffer.copy()
+            self._monitor_buffer.clear()
+        return buf
 
     def _try_post_reply_close(
         self, user_text: str, reply_text: str, chat_id: str, message_id: str,
@@ -281,6 +304,131 @@ class Supervisor:
         """Push task result/status to Feishu. Delegates to notification module."""
         from .notification import notify_task_result
         notify_task_result(self, task, chat_id)
+
+    # ── Monitor fix confirmation ──
+
+    async def _handle_monitor_fix_response(
+        self, text: str, chat_id: str, message_id: str,
+    ) -> bool:
+        """Handle user response to a pending monitor fix. Returns True if consumed."""
+        from . import conversation_monitor as _cm
+
+        pending = self._pending_monitor_fix  # local snapshot
+        if pending is None:
+            return False
+
+        # Expire stale pending fixes (> 10 min)
+        created = pending.get("created", 0)
+        if time.time() - created > 600:
+            self._pending_monitor_fix = None
+            return False
+
+        state = pending.get("state")
+
+        if state == "awaiting_first":
+            if _cm.looks_like_confirm(text):
+                plan = pending.get("plan", "")
+                reply = f"📋 修复计划:\n{plan}\n\n确认执行? 回复 '确认' 或 '不用了'"
+                self.gateway.reply_message(message_id, reply)
+                self._pending_monitor_fix = {**pending, "state": "awaiting_final"}
+                self._record_message("user", text)
+                self._record_message("assistant", reply)
+                return True
+            elif _cm.looks_like_reject(text):
+                self._pending_monitor_fix = None
+                self.gateway.reply_message(message_id, "好的，已取消修复。")
+                self._record_message("user", text)
+                self._record_message("assistant", "好的，已取消修复。")
+                return True
+            else:
+                # User said something unrelated — clear pending and route normally
+                self._pending_monitor_fix = None
+                return False
+
+        elif state == "awaiting_final":
+            if _cm.looks_like_confirm(text):
+                issues = pending.get("issues", [])
+                self._pending_monitor_fix = None
+                self._record_message("user", text)
+                await self._dispatch_monitor_fix(issues, chat_id, message_id)
+                return True
+            elif _cm.looks_like_reject(text):
+                self._pending_monitor_fix = None
+                self.gateway.reply_message(message_id, "好的，已取消修复。")
+                self._record_message("user", text)
+                self._record_message("assistant", "好的，已取消修复。")
+                return True
+            else:
+                # User said something unrelated — clear pending and route normally
+                self._pending_monitor_fix = None
+                return False
+
+        return False
+
+    async def _dispatch_monitor_fix(
+        self, issues: list[dict], chat_id: str, message_id: str,
+    ):
+        """Dispatch a fix task for the detected issues."""
+        if not self._task_dispatcher:
+            self.gateway.reply_message(message_id, "任务调度器不可用")
+            return
+
+        descriptions = [
+            f"[{i.get('severity', '?')}] {i.get('description', '')}"
+            for i in issues
+        ]
+        prompt = (
+            "自动修复以下检测到的问题:\n"
+            + "\n".join(f"- {d}" for d in descriptions)
+            + "\n\n修复方案:\n"
+            + "\n".join(
+                f"- {i.get('suggested_fix', '检查并修复')}" for i in issues
+            )
+        )
+        desc = f"自动修复: {descriptions[0][:50]}" if descriptions else "自动修复"
+
+        self.gateway.reply_message(message_id, f"🔧 已开始自动修复: {desc}")
+        self._record_message("assistant", f"🔧 已开始自动修复: {desc}")
+
+        task = await self._task_dispatcher.dispatch(
+            prompt=prompt,
+            cwd="/workspace",
+            description=desc,
+            chat_id=chat_id,
+            on_complete=lambda t: self._notify_task_result(t, chat_id),
+        )
+        if task:
+            self._message_task_map[message_id] = task.id
+
+    def _on_monitor_issues_found(self, issues: list[dict]):
+        """Called by scheduler when monitor detects issues. Push notification + set pending state."""
+        from . import conversation_monitor as _cm
+
+        chat_id = self.gateway.push_chat_id
+        if not chat_id:
+            logger.warning("No push_chat_id set, cannot notify monitor issues")
+            return
+
+        # Don't overwrite an active pending fix that's still fresh (< 10 min)
+        if self._pending_monitor_fix:
+            created = self._pending_monitor_fix.get("created", 0)
+            if time.time() - created < 600:
+                logger.info("Skipping new monitor issues — pending fix still active")
+                return
+
+        notification = _cm.format_issue_notification(issues)
+        if not notification:
+            return
+
+        plan = _cm.format_fix_plan(issues)
+
+        self.gateway.push_message(notification)
+        self._pending_monitor_fix = {
+            "state": "awaiting_first",
+            "issues": issues,
+            "plan": plan,
+            "created": time.time(),
+        }
 
     # Thin delegation wrappers for backward compatibility with tests
     async def _handle_dispatch(self, text, chat_id, message_id, result):
@@ -378,6 +526,34 @@ class Supervisor:
 
         try:
             from .scheduler import Scheduler
+            from . import conversation_monitor as _cm
+
+            # Validate API key availability at startup
+            _api_key_available = bool(self.claude._resolve_api_key())
+            if not _api_key_available:
+                logger.warning(
+                    "No Anthropic API key found — conversation monitor will be disabled"
+                )
+
+            async def _analyze_conv():
+                buf = self._flush_monitor_buffer()
+                tasks_ctx = self._get_tasks_context()
+                active_tasks = []
+                for key in ("active", "awaiting"):
+                    for t in (tasks_ctx.get(key) or []):
+                        active_tasks.append(t if isinstance(t, dict) else {"description": str(t)})
+                sessions_text = (
+                    self._session_monitor.get_sessions_text()
+                    if self._session_monitor else ""
+                )
+                api_key = self.claude._resolve_api_key()
+                return await _cm.analyze_conversation(
+                    messages=buf,
+                    active_tasks=active_tasks,
+                    active_sessions=sessions_text,
+                    api_key=api_key,
+                )
+
             self._scheduler = Scheduler(
                 get_system_status=(
                     self._container_monitor.get_system_status
@@ -396,6 +572,8 @@ class Supervisor:
                     if self._task_dispatcher else None
                 ),
                 push_message=self.gateway.push_message,
+                analyze_conversation=_analyze_conv,
+                on_issues_found=self._on_monitor_issues_found,
             )
             await self._scheduler.start()
             logger.info("Scheduler started")
