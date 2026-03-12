@@ -13,7 +13,6 @@ Usage:
 
 import asyncio
 import logging
-import re
 import signal
 import threading
 import time
@@ -24,7 +23,7 @@ from collections import deque
 from .claude_session import ClaudeSession
 from .feishu_gateway import FeishuGateway
 from .router_skill import build_route_system_prompt, build_route_user_prompt
-from .task_dispatcher import _looks_like_close, _contains_close_intent, _looks_like_needs_input
+from .task_dispatcher import _looks_like_close, _contains_close_intent
 
 logger = logging.getLogger(__name__)
 

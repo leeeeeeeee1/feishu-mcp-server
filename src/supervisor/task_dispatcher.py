@@ -11,7 +11,7 @@ import logging
 import os
 import threading
 import time
-from dataclasses import dataclass, field, asdict, replace as dc_replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 from uuid import uuid4
@@ -30,8 +30,6 @@ _CHECKPOINT_DIR = Path(os.environ.get("SUPERVISOR_CHECKPOINT_DIR", "/tmp/supervi
 # asyncio StreamReader default limit is 64KB — too small for claude stream-json
 # which can emit single lines >64KB (e.g. large code blocks). 10MB is safe.
 _STREAM_LIMIT = 10 * 1024 * 1024  # 10 MB
-
-import re as _re  # used by _SAFE_ID_RE below
 
 # Re-export pattern matching functions for backward compatibility
 from .patterns import (  # noqa: F401
@@ -104,9 +102,8 @@ _background_handles: dict[str, asyncio.Task] = {}
 
 _TASKS_FILE = Path(os.environ.get("SUPERVISOR_TASKS_FILE", "/tmp/supervisor-tasks.json"))
 
-from .task_persistence import (  # noqa: E402
+from .task_persistence import (  # noqa: E402, F401
     _ACTIVE_PROCESS_STATUSES,
-    _SAFE_ID_RE,
     save_tasks as _save_tasks_impl,
     save_tasks_unlocked as _save_tasks_unlocked_impl,
     checkpoint_path as _checkpoint_path_impl,

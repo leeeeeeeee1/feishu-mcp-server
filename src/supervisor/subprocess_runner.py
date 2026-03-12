@@ -2,8 +2,12 @@
 
 Handles building commands and executing `claude -p` via streaming and
 non-streaming modes, with timeout handling and fallback logic.
-Uses late imports from task_dispatcher for _set_status/_save_checkpoint
-to avoid circular imports.
+
+Circular dependency note: task_dispatcher re-exports from this module,
+and this module late-imports task_dispatcher inside functions to access
+_set_status, _save_checkpoint, _clear_checkpoint, _STREAM_LIMIT, and
+SUPERVISOR_TASK_TIMEOUT. This is intentional — do not convert to
+top-level imports or the circular import will fail at load time.
 """
 
 from __future__ import annotations

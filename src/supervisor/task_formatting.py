@@ -1,12 +1,15 @@
 """Feishu message formatting for tasks.
 
 Converts Task objects into human-readable text for Feishu chat display.
-Uses duck typing — no import of Task needed.
 """
 
 from __future__ import annotations
 
 import time
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .task_dispatcher import Task
 
 
 def _status_icon(status: str) -> str:
@@ -28,7 +31,7 @@ def _status_icon(status: str) -> str:
     return icons.get(status, status.upper())
 
 
-def _elapsed_str(task) -> str:
+def _elapsed_str(task: "Task") -> str:
     """Human-readable elapsed time."""
     if not task.started_at:
         return ""
@@ -41,7 +44,7 @@ def _elapsed_str(task) -> str:
     return f"{mins}m{remaining}s"
 
 
-def _format_task(task) -> str:
+def _format_task(task: "Task") -> str:
     """Format a single task with description, progress, and current step."""
     lines: list[str] = []
 
