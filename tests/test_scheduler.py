@@ -2,7 +2,7 @@
 
 import asyncio
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from supervisor.scheduler import (
     Scheduler,
@@ -197,7 +197,7 @@ class TestLifecycle:
         async def _test():
             await scheduler.start()
             assert scheduler._running is True
-            assert len(scheduler._tasks) == 3
+            assert len(scheduler._tasks) == 4
             await scheduler.stop()
             assert scheduler._running is False
             assert len(scheduler._tasks) == 0
@@ -210,7 +210,99 @@ class TestLifecycle:
         async def _test():
             await scheduler.start()
             await scheduler.start()  # Should warn, not crash
-            assert len(scheduler._tasks) == 3
+            assert len(scheduler._tasks) == 4
             await scheduler.stop()
+
+        asyncio.run(_test())
+
+
+class TestConversationMonitor:
+    def test_no_analyzer_skips(self):
+        scheduler = Scheduler(analyze_conversation=None)
+
+        async def _test():
+            await scheduler._run_conversation_monitor()
+            assert scheduler._monitor_check_count == 1
+
+        asyncio.run(_test())
+
+    def test_issues_found_calls_handler(self):
+        on_issues = MagicMock()
+
+        async def fake_analyze():
+            return {
+                "has_issues": True,
+                "issues": [{"severity": "HIGH", "description": "stuck", "suggested_fix": "restart"}],
+                "summary": "found issue",
+            }
+
+        scheduler = Scheduler(
+            analyze_conversation=fake_analyze,
+            on_issues_found=on_issues,
+            push_message=MagicMock(),
+        )
+
+        async def _test():
+            await scheduler._run_conversation_monitor()
+            assert scheduler._monitor_check_count == 1
+            on_issues.assert_called_once()
+            issues = on_issues.call_args[0][0]
+            assert len(issues) == 1
+            assert issues[0]["severity"] == "HIGH"
+
+        asyncio.run(_test())
+
+    def test_no_issues_does_not_call_handler(self):
+        on_issues = MagicMock()
+
+        async def fake_analyze():
+            return {"has_issues": False, "issues": [], "summary": "all good"}
+
+        scheduler = Scheduler(
+            analyze_conversation=fake_analyze,
+            on_issues_found=on_issues,
+        )
+
+        async def _test():
+            await scheduler._run_conversation_monitor()
+            on_issues.assert_not_called()
+
+        asyncio.run(_test())
+
+    def test_fallback_push_when_no_handler(self):
+        push = MagicMock()
+
+        async def fake_analyze():
+            return {
+                "has_issues": True,
+                "issues": [{"severity": "HIGH", "description": "error", "suggested_fix": "fix"}],
+                "summary": "issue",
+            }
+
+        scheduler = Scheduler(
+            analyze_conversation=fake_analyze,
+            on_issues_found=None,
+            push_message=push,
+        )
+
+        async def _test():
+            await scheduler._run_conversation_monitor()
+            push.assert_called_once()
+            assert "error" in push.call_args[0][0]
+
+        asyncio.run(_test())
+
+    def test_analyzer_error_handled(self):
+        async def broken_analyze():
+            raise RuntimeError("API down")
+
+        scheduler = Scheduler(
+            analyze_conversation=broken_analyze,
+            push_message=MagicMock(),
+        )
+
+        async def _test():
+            # Should not raise
+            await scheduler._run_conversation_monitor()
 
         asyncio.run(_test())

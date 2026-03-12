@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 HEALTH_INTERVAL = int(os.environ.get("SUPERVISOR_HEALTH_INTERVAL", 300))  # 5 min
 SESSION_DIGEST_INTERVAL = int(os.environ.get("SUPERVISOR_SESSION_DIGEST_INTERVAL", 900))  # 15 min
 DAILY_REPORT_INTERVAL = int(os.environ.get("SUPERVISOR_DAILY_REPORT_INTERVAL", 86400))  # 24h
+CONVERSATION_MONITOR_INTERVAL = int(os.environ.get("SUPERVISOR_CONV_MONITOR_INTERVAL", 300))  # 5 min
 
 # Alert thresholds
 CPU_THRESHOLD = float(os.environ.get("SUPERVISOR_CPU_THRESHOLD", 90))
@@ -33,6 +34,8 @@ class Scheduler:
         get_sessions_text: Optional[Callable] = None,
         get_tasks_text: Optional[Callable] = None,
         push_message: Optional[Callable] = None,
+        analyze_conversation: Optional[Callable] = None,
+        on_issues_found: Optional[Callable] = None,
     ):
         """Initialize with callable hooks from other modules.
 
@@ -42,18 +45,23 @@ class Scheduler:
             get_sessions_text: Returns formatted session summary string
             get_tasks_text: Returns formatted task summary string
             push_message: Callable(text) to push message to Feishu
+            analyze_conversation: Async callable() returning analysis result dict
+            on_issues_found: Callable(issues) when monitor detects problems
         """
         self._get_system_status = get_system_status
         self._get_gpu_status = get_gpu_status
         self._get_sessions_text = get_sessions_text
         self._get_tasks_text = get_tasks_text
         self._push_message = push_message
+        self._analyze_conversation = analyze_conversation
+        self._on_issues_found = on_issues_found
         self._tasks: list[asyncio.Task] = []
         self._running = False
         self._start_time = 0.0
         # Counters for daily report
         self._health_check_count = 0
         self._alert_count = 0
+        self._monitor_check_count = 0
 
     async def start(self):
         """Start all periodic tasks."""
@@ -72,6 +80,7 @@ class Scheduler:
             asyncio.create_task(self._periodic_health_check()),
             asyncio.create_task(self._periodic_session_digest()),
             asyncio.create_task(self._periodic_daily_report()),
+            asyncio.create_task(self._periodic_conversation_monitor()),
         ]
 
     async def stop(self):
@@ -231,3 +240,43 @@ class Scheduler:
         # Reset counters
         self._health_check_count = 0
         self._alert_count = 0
+        self._monitor_check_count = 0
+
+    # ── Conversation Monitor ──
+
+    async def _periodic_conversation_monitor(self):
+        """Analyze conversation buffer every CONVERSATION_MONITOR_INTERVAL seconds."""
+        while self._running:
+            await asyncio.sleep(CONVERSATION_MONITOR_INTERVAL)
+            try:
+                await self._run_conversation_monitor()
+            except Exception as e:
+                logger.error("Conversation monitor failed: %s", e)
+
+    async def _run_conversation_monitor(self):
+        """Analyze recent conversations and notify if issues found."""
+        self._monitor_check_count += 1
+
+        if not self._analyze_conversation:
+            return
+
+        try:
+            result = await self._analyze_conversation()
+        except Exception as e:
+            logger.error("Conversation analysis failed: %s", e)
+            return
+
+        if result.get("has_issues") and result.get("issues"):
+            if self._on_issues_found:
+                try:
+                    self._on_issues_found(result["issues"])
+                except Exception as e:
+                    logger.error("Failed to handle found issues: %s", e)
+            else:
+                # Fallback: push raw notification
+                from . import conversation_monitor as _cm
+                msg = _cm.format_issue_notification(result["issues"])
+                if msg:
+                    self._push(msg)
+        else:
+            logger.debug("Conversation monitor: %s", result.get("summary", "no issues"))

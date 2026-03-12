@@ -49,8 +49,9 @@ src/
     ├── task_formatting.py  # Task display formatting
     ├── patterns.py         # Input/close pattern matching
     ├── prompt_builders.py  # Worker prompt construction
-    ├── scheduler.py        # Cron-like task scheduling
-    └── session_monitor.py  # Session health monitoring
+    ├── scheduler.py             # Cron-like task scheduling
+    ├── session_monitor.py       # Session health monitoring
+    └── conversation_monitor.py  # Periodic dialogue analysis + fix dispatch
 ```
 
 ## Key Patterns
@@ -77,47 +78,29 @@ pytest tests/test_task_dispatcher.py -v
 - Mock `asyncio.create_subprocess_exec` for Claude subprocess tests
 - Use `_reset()` fixture to clean task state between tests
 
-## Swarm Roles (Mandatory Multi-Agent Development)
+## Swarm Roles (Mandatory Multi-Agent Development v2)
 
-ALL development uses the swarm pattern. No single-agent work allowed. Use `/swarm <task>` to execute.
+ALL development uses the 8-phase swarm. No single-agent work. Use `/swarm <task>` to execute.
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                   Coordinator (主控)                       │
-│         Decompose → Dispatch → Apply → Verify             │
-└──────┬──────┬───────────┬────────────┬──────────────────┘
-       │      │           │            │
-       ▼      ▼           ▼            ▼
-  ┌────────┐ ┌──────────┐ ┌─────────┐ ┌───────────┐
-  │   PM   │ │Developer │ │  E2E    │ │   Git     │
-  │  Agent │ │ Agent(s) │ │ Tester  │ │  Manager  │
-  └────────┘ └──────────┘ └─────────┘ └───────────┘
-                    +
-              ┌───────────┐
-              │   Code    │
-              │ Reviewer  │
-              └───────────┘
-```
+| Role | Responsibility | Phase | Writes Files? |
+|------|---------------|-------|---------------|
+| **PM Agent** | AC (tagged UNIT/E2E) + CLAUDE.md updates | 0 (blocking) | No |
+| **Developer(s)** | TDD edit specs: tests first → implementation | 1 (parallel) | No |
+| **Code Reviewer** | Findings + concrete fix edit specs | 3 | No |
+| **E2E Tester** | Write/delete real test files + run pytest | **5 (last)** | **Yes** |
+| **Git Manager** | Commit + PR + **merge** + cleanup | 7 | **Yes** |
 
-| Role | Responsibility | Key Rule |
-|------|---------------|----------|
-| **PM Agent** | Requirements → user stories → acceptance criteria → CLAUDE.md updates | BLOCKING: runs first, every task |
-| **Developer(s)** | TDD: failing tests → implementation (edit specs only) | Never writes files directly |
-| **E2E Tester** | Business-level tests covering complete user flows | Runs twice: write tests + verify |
-| **Code Reviewer** | Quality, security, thread safety, patterns | CRITICAL/HIGH must be fixed |
-| **Git Manager** | Branch, atomic commits, PR, merge | Only after all tests pass |
-
-## Development Workflow (MANDATORY Swarm Phases)
+## Development Workflow (MANDATORY 8-Phase Swarm)
 
 ```
-Phase 0: PM Agent        → requirements + acceptance criteria + CLAUDE.md updates
-Phase 1: Developer(s)    → TDD edit specs (parallel per module)
-         + E2E Tester    → business-level test edit specs (parallel)
-Phase 2: Coordinator     → apply all edits + run tests
-Phase 3: Code Reviewer   → quality/security review (parallel)
-         + E2E Tester    → verify acceptance criteria (parallel)
-Phase 4: Coordinator     → fix issues + re-verify
-Phase 5: Git Manager     → branch + commit + PR
+Phase 0: PM Agent          → AC list (UNIT/E2E tagged) + CLAUDE.md updates
+Phase 1: Developer(s)      → TDD edit specs (parallel per module)
+Phase 2: Coordinator        → apply edits + unit tests (must pass)
+Phase 3: Code Reviewer      → findings + fix edit specs
+Phase 4: Coordinator        → apply fixes + re-test (must pass)
+Phase 5: E2E Tester         → write/run real user flow tests (LAST validation)
+Phase 6: Fix Loop           → E2E fails? fix → re-test (max 3 rounds)
+Phase 7: Git Manager        → commit → PR → merge → cleanup
 ```
 
 Skipping ANY phase is a workflow violation. See `.claude/commands/swarm.md` for full protocol.
@@ -125,8 +108,10 @@ Skipping ANY phase is a workflow violation. See `.claude/commands/swarm.md` for 
 ### Key Constraints
 - PM validates every request against the **AI Butler vision**
 - PM **can modify this CLAUDE.md** to update project structure, skills, workflow
-- E2E tests are **continuously maintained** — they evolve with requirements
-- Git Manager is a **dedicated role**, not mixed into Coordinator
+- **E2E Tester is Phase 5 (LAST)** — validates final integrated code, not specs
+- E2E tests simulate **real Feishu user flows**: message → route → dispatch → result → close
+- **Iterative fix loop** (max 3 rounds) when E2E tests fail
+- Git Manager **merges the PR** — full cycle, not half
 - All agent prompts include the project vision context
 
 ## Skills Reference
