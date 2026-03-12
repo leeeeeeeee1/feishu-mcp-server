@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass, field, asdict, replace as dc_replace
 from pathlib import Path
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 SUPERVISOR_MAX_WORKERS = int(os.environ.get("SUPERVISOR_MAX_WORKERS", "3"))
 SUPERVISOR_MAX_DAEMONS = int(os.environ.get("SUPERVISOR_MAX_DAEMONS", "2"))
+SUPERVISOR_TASK_TIMEOUT = int(os.environ.get("SUPERVISOR_TASK_TIMEOUT", "1800"))
 
 # Checkpoint directory for crash recovery
 _CHECKPOINT_DIR = Path(os.environ.get("SUPERVISOR_CHECKPOINT_DIR", "/tmp/supervisor-checkpoints"))
@@ -186,6 +188,7 @@ def _generate_description(prompt: str) -> str:
 # ── Dispatcher singleton state ──
 
 _tasks: dict[str, Task] = {}
+_tasks_lock = threading.Lock()  # Protects all reads/writes to _tasks
 _worker_semaphore: asyncio.Semaphore | None = None
 _daemon_semaphore: asyncio.Semaphore | None = None
 _background_handles: dict[str, asyncio.Task] = {}
@@ -196,7 +199,17 @@ _TASKS_FILE = Path(os.environ.get("SUPERVISOR_TASKS_FILE", "/tmp/supervisor-task
 
 
 def _save_tasks() -> None:
-    """Persist all tasks to disk."""
+    """Persist all tasks to disk.
+
+    NOTE: Caller must NOT hold _tasks_lock when calling this, or use
+    _save_tasks_unlocked() if already holding the lock.
+    """
+    with _tasks_lock:
+        _save_tasks_unlocked()
+
+
+def _save_tasks_unlocked() -> None:
+    """Persist all tasks to disk. Caller MUST hold _tasks_lock."""
     try:
         data = {tid: asdict(t) for tid, t in _tasks.items()}
         tmp = _TASKS_FILE.with_suffix(".tmp")
@@ -347,7 +360,8 @@ def _load_tasks() -> None:
                     tid[:8], old_status, bool(task.session_id), len(task.steps_completed),
                 )
 
-            _tasks[tid] = task
+            with _tasks_lock:
+                _tasks[tid] = task
 
         if interrupted_count:
             logger.info(
@@ -379,10 +393,11 @@ def _get_daemon_semaphore() -> asyncio.Semaphore:
 
 
 def _set_status(task: Task, new_status: str) -> None:
-    old = task.status
-    task.status = new_status
-    logger.info("Task %s: %s -> %s", task.id[:8], old, new_status)
-    _save_tasks()
+    with _tasks_lock:
+        old = task.status
+        task.status = new_status
+        logger.info("Task %s: %s -> %s", task.id[:8], old, new_status)
+        _save_tasks_unlocked()
 
 
 # ── Core subprocess runner ──
@@ -409,7 +424,9 @@ async def _run_claude_streaming(task: Task, env: dict) -> bool:
         return False
 
     accumulated_text = ""
-    try:
+
+    async def _read_stream():
+        nonlocal accumulated_text
         async for raw_line in proc.stdout:
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line:
@@ -451,6 +468,18 @@ async def _run_claude_streaming(task: Task, env: dict) -> bool:
                     task.session_id = sid
                 break
 
+    try:
+        await asyncio.wait_for(_read_stream(), timeout=SUPERVISOR_TASK_TIMEOUT)
+    except asyncio.TimeoutError:
+        _save_checkpoint(task)
+        try:
+            proc.kill()
+            await proc.wait()
+        except ProcessLookupError:
+            pass
+        task.error = f"Timed out after {SUPERVISOR_TASK_TIMEOUT}s (streaming)"
+        logger.warning("Task %s: streaming timed out after %ds", task.id[:8], SUPERVISOR_TASK_TIMEOUT)
+        return False
     except Exception as exc:  # noqa: BLE001
         task.error = str(exc)
         return False
@@ -663,8 +692,9 @@ async def dispatch(
         cwd=cwd or "",
         created_at=time.time(),
     )
-    _tasks[task.id] = task
-    _save_tasks()
+    with _tasks_lock:
+        _tasks[task.id] = task
+        _save_tasks_unlocked()
     logger.info("Dispatched %s task %s: %s", task_type, task.id[:8], prompt[:80])
 
     if task_type == "daemon":
@@ -689,11 +719,12 @@ async def resume_task(task_id: str, user_input: str) -> str:
     Raises:
         ValueError: If task is not in waiting_for_input status.
     """
-    task = _tasks.get(task_id)
-    if task is None:
-        raise ValueError(f"Unknown task: {task_id}")
-    if task.status != "waiting_for_input":
-        raise ValueError(f"Task {task_id} is not waiting for input (status={task.status})")
+    with _tasks_lock:
+        task = _tasks.get(task_id)
+        if task is None:
+            raise ValueError(f"Unknown task: {task_id}")
+        if task.status != "waiting_for_input":
+            raise ValueError(f"Task {task_id} is not waiting for input (status={task.status})")
 
     cmd = _build_cmd(user_input, session_id=task.session_id)
     env = _build_env()
@@ -709,7 +740,13 @@ async def resume_task(task_id: str, user_input: str) -> str:
             env=env,
             cwd=task.cwd or None,
         )
-        stdout, stderr = await proc.communicate()
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=SUPERVISOR_TASK_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        task.error = f"Timed out after {SUPERVISOR_TASK_TIMEOUT}s"
+        _set_status(task, "failed")
+        return f"Error: {task.error}"
     except Exception as exc:  # noqa: BLE001
         task.error = str(exc)
         _set_status(task, "failed")
@@ -748,11 +785,12 @@ def submit_review(task_id: str, feedback: str) -> str:
     Returns:
         The feedback text (caller feeds this to Claude for skill extraction).
     """
-    task = _tasks.get(task_id)
-    if task is None:
-        raise ValueError(f"Unknown task: {task_id}")
-    if task.status != "review":
-        raise ValueError(f"Task {task_id} is not in review (status={task.status})")
+    with _tasks_lock:
+        task = _tasks.get(task_id)
+        if task is None:
+            raise ValueError(f"Unknown task: {task_id}")
+        if task.status != "review":
+            raise ValueError(f"Task {task_id} is not in review (status={task.status})")
 
     _set_status(task, "learning")
     _set_status(task, "completed")
@@ -771,7 +809,8 @@ def _validate_follow_up(task_id: str) -> "Task":
     Raises:
         ValueError: If task not found, not awaiting closure, or has no session.
     """
-    task = _tasks.get(task_id)
+    with _tasks_lock:
+        task = _tasks.get(task_id)
     if task is None:
         raise ValueError(f"Unknown task: {task_id}")
     if task.status != "awaiting_closure":
@@ -830,7 +869,9 @@ async def _follow_up_streaming(task: Task, user_input: str, env: dict) -> Option
         return None
 
     accumulated_text = ""
-    try:
+
+    async def _read_follow_up():
+        nonlocal accumulated_text
         async for raw_line in proc.stdout:
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line:
@@ -852,6 +893,17 @@ async def _follow_up_streaming(task: Task, user_input: str, env: dict) -> Option
             elif data.get("type") == "result":
                 accumulated_text = data.get("result", "") or accumulated_text
                 break
+
+    try:
+        await asyncio.wait_for(_read_follow_up(), timeout=SUPERVISOR_TASK_TIMEOUT)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+            await proc.wait()
+        except ProcessLookupError:
+            pass
+        logger.warning("Follow-up streaming timed out after %ds", SUPERVISOR_TASK_TIMEOUT)
+        return None
     except Exception as exc:
         logger.warning("Follow-up streaming error: %s", exc)
         return None
@@ -903,16 +955,19 @@ def close_task(task_id: str) -> str:
 
     Returns confirmation message.
     """
-    task = _tasks.get(task_id)
-    if task is None:
-        raise ValueError(f"Unknown task: {task_id}")
-    if task.status not in ("awaiting_closure", "done", "review"):
-        raise ValueError(
-            f"Task {task_id[:8]} cannot be closed (status={task.status})"
-        )
-
-    task.finished_at = time.time()
-    _set_status(task, "completed")
+    with _tasks_lock:
+        task = _tasks.get(task_id)
+        if task is None:
+            raise ValueError(f"Unknown task: {task_id}")
+        if task.status not in ("awaiting_closure", "done", "review"):
+            raise ValueError(
+                f"Task {task_id[:8]} cannot be closed (status={task.status})"
+            )
+        task.finished_at = time.time()
+        old = task.status
+        task.status = "completed"
+        logger.info("Task %s: %s -> completed", task.id[:8], old)
+        _save_tasks_unlocked()
     return f"Task {task_id[:8]} closed."
 
 
@@ -933,7 +988,8 @@ def close_tasks(task_ids: list[str]) -> list[str]:
 
 def get_awaiting_closure() -> list[Task]:
     """Return tasks in awaiting_closure status."""
-    return [t for t in _tasks.values() if t.status == "awaiting_closure"]
+    with _tasks_lock:
+        return [t for t in _tasks.values() if t.status == "awaiting_closure"]
 
 
 def skip_review(task_id: str) -> str:
@@ -942,11 +998,12 @@ def skip_review(task_id: str) -> str:
     Returns:
         Confirmation message.
     """
-    task = _tasks.get(task_id)
-    if task is None:
-        raise ValueError(f"Unknown task: {task_id}")
-    if task.status not in ("done", "review"):
-        raise ValueError(f"Task {task_id} cannot skip review (status={task.status})")
+    with _tasks_lock:
+        task = _tasks.get(task_id)
+        if task is None:
+            raise ValueError(f"Unknown task: {task_id}")
+        if task.status not in ("done", "review"):
+            raise ValueError(f"Task {task_id} cannot skip review (status={task.status})")
 
     _set_status(task, "completed")
     return f"Task {task_id[:8]} marked as completed (review skipped)."
@@ -957,30 +1014,35 @@ def skip_review(task_id: str) -> str:
 
 def get_task(task_id: str) -> Task:
     """Get a single task by ID."""
-    task = _tasks.get(task_id)
+    with _tasks_lock:
+        task = _tasks.get(task_id)
     if task is None:
         raise ValueError(f"Unknown task: {task_id}")
     return task
 
 
 def list_tasks() -> list[Task]:
-    """Return all tasks."""
-    return list(_tasks.values())
+    """Return a snapshot of all tasks (safe to iterate without lock)."""
+    with _tasks_lock:
+        return list(_tasks.values())
 
 
 def list_daemons() -> list[Task]:
     """Return only daemon tasks."""
-    return [t for t in _tasks.values() if t.task_type == "daemon"]
+    with _tasks_lock:
+        return [t for t in _tasks.values() if t.task_type == "daemon"]
 
 
 def get_review_pending() -> list[Task]:
     """Return tasks in review or waiting_for_input status."""
-    return [t for t in _tasks.values() if t.status in ("review", "waiting_for_input")]
+    with _tasks_lock:
+        return [t for t in _tasks.values() if t.status in ("review", "waiting_for_input")]
 
 
 def list_interrupted() -> list[Task]:
     """Return tasks in interrupted status (recoverable after restart)."""
-    return [t for t in _tasks.values() if t.status == "interrupted"]
+    with _tasks_lock:
+        return [t for t in _tasks.values() if t.status == "interrupted"]
 
 
 async def recover_task(
@@ -1004,27 +1066,30 @@ async def recover_task(
     Raises:
         ValueError: If task not found or not in interrupted status.
     """
-    task = _tasks.get(task_id)
-    if task is None:
-        raise ValueError(f"Unknown task: {task_id}")
-    if task.status != "interrupted":
-        raise ValueError(
-            f"Task {task_id[:8]} is not interrupted (status={task.status})"
-        )
+    with _tasks_lock:
+        task = _tasks.get(task_id)
+        if task is None:
+            raise ValueError(f"Unknown task: {task_id}")
+        if task.status != "interrupted":
+            raise ValueError(
+                f"Task {task_id[:8]} is not interrupted (status={task.status})"
+            )
 
     if mode == "dismiss":
-        task.status = "failed"
-        task.error = "Dismissed by user after restart interruption"
-        task.finished_at = time.time()
-        _save_tasks()
+        with _tasks_lock:
+            task.status = "failed"
+            task.error = "Dismissed by user after restart interruption"
+            task.finished_at = time.time()
+            _save_tasks_unlocked()
         _clear_checkpoint(task_id)
         logger.info("Task %s: interrupted → dismissed (failed)", task_id[:8])
         return None
 
     # Mark original as completed (superseded by recovery task)
-    task.status = "completed"
-    task.finished_at = time.time()
-    _save_tasks()
+    with _tasks_lock:
+        task.status = "completed"
+        task.finished_at = time.time()
+        _save_tasks_unlocked()
     _clear_checkpoint(task_id)
 
     # Build the recovery dispatch
@@ -1074,11 +1139,12 @@ def stop_daemon(task_id: str) -> str:
     Returns:
         Confirmation message.
     """
-    task = _tasks.get(task_id)
-    if task is None:
-        raise ValueError(f"Unknown task: {task_id}")
-    if task.task_type != "daemon":
-        raise ValueError(f"Task {task_id} is not a daemon")
+    with _tasks_lock:
+        task = _tasks.get(task_id)
+        if task is None:
+            raise ValueError(f"Unknown task: {task_id}")
+        if task.task_type != "daemon":
+            raise ValueError(f"Task {task_id} is not a daemon")
 
     _set_status(task, "cancelled")
     task.finished_at = time.time()
@@ -1096,9 +1162,10 @@ def cancel_task(task_id: str) -> str:
     Returns:
         Confirmation message.
     """
-    task = _tasks.get(task_id)
-    if task is None:
-        raise ValueError(f"Unknown task: {task_id}")
+    with _tasks_lock:
+        task = _tasks.get(task_id)
+        if task is None:
+            raise ValueError(f"Unknown task: {task_id}")
 
     _set_status(task, "cancelled")
     task.finished_at = time.time()
@@ -1193,12 +1260,14 @@ def _format_task(task: Task) -> str:
 
 def get_tasks_text() -> str:
     """Formatted summary of all tasks for Feishu."""
-    if not _tasks:
-        return "No tasks."
+    with _tasks_lock:
+        if not _tasks:
+            return "No tasks."
+        snapshot = list(_tasks.values())
 
-    running = [t for t in _tasks.values() if t.status == "running"]
-    pending = [t for t in _tasks.values() if t.status == "pending"]
-    finished = [t for t in _tasks.values() if t.status not in ("running", "pending")]
+    running = [t for t in snapshot if t.status == "running"]
+    pending = [t for t in snapshot if t.status == "pending"]
+    finished = [t for t in snapshot if t.status not in ("running", "pending")]
 
     sections: list[str] = []
     sections.append(f"Tasks: {len(running)} running, {len(pending)} pending, {len(finished)} finished")
@@ -1225,7 +1294,8 @@ def get_daemons_text() -> str:
 def _reset() -> None:
     """Reset all internal state. Used by tests only."""
     global _worker_semaphore, _daemon_semaphore, _TASKS_FILE, _CHECKPOINT_DIR
-    _tasks.clear()
+    with _tasks_lock:
+        _tasks.clear()
     for h in _background_handles.values():
         if not h.done():
             h.cancel()

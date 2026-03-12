@@ -24,7 +24,7 @@ from collections import deque
 from .claude_session import ClaudeSession
 from .feishu_gateway import FeishuGateway
 from .router_skill import build_route_system_prompt, build_route_user_prompt
-from .task_dispatcher import _looks_like_close, _contains_close_intent
+from .task_dispatcher import _looks_like_close, _contains_close_intent, _looks_like_needs_input
 
 logger = logging.getLogger(__name__)
 
@@ -541,6 +541,11 @@ class Supervisor:
             self.gateway.reply_message(message_id, reply_text)
             self._record_message("assistant", reply_text)
 
+            # P0-3 fix: post-reply close detection.
+            # If Sonnet misclassified a close as reply, detect close intent
+            # in the reply text and auto-close if exactly 1 task is awaiting.
+            self._try_post_reply_close(text, reply_text, chat_id, message_id)
+
         elif action == "close":
             await self._handle_sonnet_close(result, chat_id, message_id)
 
@@ -571,6 +576,44 @@ class Supervisor:
     def _record_message(self, role: str, text: str) -> None:
         """Append a message to conversation history (auto-capped by deque maxlen)."""
         self._conversation_history.append({"role": role, "text": text})
+
+    def _try_post_reply_close(
+        self, user_text: str, reply_text: str, chat_id: str, message_id: str,
+    ) -> None:
+        """Post-reply close detection: fix for Sonnet misclassifying close as reply.
+
+        If EITHER the user's message OR Sonnet's reply contains close intent,
+        and exactly 1 task is awaiting closure, auto-close it.
+        Skip if ambiguous (0 or 2+ awaiting tasks).
+        """
+        if not self._task_dispatcher:
+            return
+
+        has_close_intent = (
+            _contains_close_intent(reply_text)
+            or _looks_like_close(user_text)
+            or _contains_close_intent(user_text)
+        )
+        if not has_close_intent:
+            return
+
+        awaiting = self._task_dispatcher.get_awaiting_closure()
+        if len(awaiting) != 1:
+            return
+
+        task = awaiting[0]
+        try:
+            self._task_dispatcher.close_task(task.id)
+            logger.info(
+                "Post-reply auto-close: task %s (user=%s, reply=%s)",
+                task.id[:8], user_text[:40], reply_text[:40],
+            )
+            # Notify user so auto-close is not silent
+            self.gateway.reply_message(
+                message_id, f"(任务 [{task.id[:8]}] 已自动关闭)"
+            )
+        except ValueError as e:
+            logger.warning("Post-reply auto-close failed: %s", e)
 
     def _get_history_text(self) -> str:
         """Format recent conversation history as text for worker context."""
