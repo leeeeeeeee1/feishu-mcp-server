@@ -31,125 +31,32 @@ _CHECKPOINT_DIR = Path(os.environ.get("SUPERVISOR_CHECKPOINT_DIR", "/tmp/supervi
 # which can emit single lines >64KB (e.g. large code blocks). 10MB is safe.
 _STREAM_LIMIT = 10 * 1024 * 1024  # 10 MB
 
-# Phrases that hint Claude is asking for user input
-_INPUT_PHRASES = ("please", "which", "should i", "confirm")
-
-
-def _looks_like_needs_input(text: str) -> bool:
-    """Heuristic: does the output look like it needs user input?"""
-    if "?" not in text:
-        return False
-    lower = text.lower()
-    return any(phrase in lower for phrase in _INPUT_PHRASES)
-
-
 import re as _re  # used by _SAFE_ID_RE below
 
-
-# Close intent detection — used by main.py for reply-based quick close (Step 0).
-# These provide a fast local fallback for Feishu thread replies where Sonnet
-# routing would add unnecessary latency for obvious acknowledgements.
-_CLOSE_PHRASES = (
-    "好的", "收到", "ok", "谢谢", "thanks", "可以了", "没问题",
-    "完成", "done", "lgtm", "不用了", "就这样", "👍", "thank you",
+# Re-export pattern matching functions for backward compatibility
+from .patterns import (  # noqa: F401
+    _INPUT_PHRASES,
+    _looks_like_needs_input,
+    _CLOSE_PHRASES,
+    _CLOSE_PHRASES_SET,
+    _CLOSE_FALSE_POSITIVES,
+    _CLOSE_INTENT_PATTERNS,
+    _contains_close_intent,
+    _looks_like_close,
 )
 
-_CLOSE_PHRASES_SET = frozenset(p.lower() for p in _CLOSE_PHRASES)
 
-# Technical nouns — if these appear near 关闭/关掉/结束, it's NOT task closure
-_TECHNICAL_NOUNS = r"连接|端口|服务|进程|窗口|文件|通道|线程|循环|socket|server|session|db|数据库|nginx|redis"
-
-_CLOSE_FALSE_POSITIVES = _re.compile(
-    rf"关闭({_TECHNICAL_NOUNS})"
-    rf"|关掉({_TECHNICAL_NOUNS})"
-    rf"|结束({_TECHNICAL_NOUNS})"
-    rf"|({_TECHNICAL_NOUNS})关掉"
-    rf"|({_TECHNICAL_NOUNS})关闭"
-    rf"|({_TECHNICAL_NOUNS})结束",
-    _re.IGNORECASE,
+# Re-export subprocess functions for backward compatibility
+from .subprocess_runner import (  # noqa: F401
+    _build_env,
+    _build_cmd,
+    _build_cmd_streaming,
+    _run_claude_streaming,
+    _run_claude_non_streaming,
+    _run_claude,
+    _follow_up_streaming,
+    _follow_up_non_streaming,
 )
-
-_CLOSE_INTENT_PATTERNS = [
-    _re.compile(r"关闭(了|吧|这个|那个)"),
-    _re.compile(r"关了"),
-    _re.compile(r"关掉"),
-    _re.compile(r"结束(吧|了|掉|这个|那个|任务)"),
-    _re.compile(r"不用了"),
-    _re.compile(r"完事了"),
-    _re.compile(r"可以关了"),
-    _re.compile(r"\bclose\b", _re.IGNORECASE),
-    _re.compile(r"\bdone with it\b", _re.IGNORECASE),
-]
-
-
-def _contains_close_intent(text: str) -> bool:
-    """Detect close intent in longer text (not just short phrases).
-
-    Unlike _looks_like_close (≤10 char exact match), this works on any
-    length text. Conservative: excludes technical phrases like "关闭连接".
-    Note: the false-positive guard only covers post-verb position.
-    """
-    if not text or not text.strip():
-        return False
-    if _CLOSE_FALSE_POSITIVES.search(text):
-        return False
-    return any(pat.search(text) for pat in _CLOSE_INTENT_PATTERNS)
-
-
-def _looks_like_close(text: str) -> bool:
-    """Heuristic: short acknowledgement → close intent, not follow-up.
-
-    Uses exact match after normalization to avoid false positives.
-    """
-    stripped = text.strip()
-    if not stripped:
-        return False
-    if "?" in stripped or "？" in stripped or "吗" in stripped:
-        return False
-    normalized = stripped.lower().rstrip("。.!！~，,").strip()
-    if len(normalized) > 10:
-        return False
-    return normalized in _CLOSE_PHRASES_SET
-
-
-def _build_env() -> dict[str, str]:
-    """Build environment for subprocess, removing CLAUDECODE to avoid nesting."""
-    return {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
-
-
-def _build_cmd(
-    prompt: str,
-    session_id: Optional[str] = None,
-) -> list[str]:
-    """Build the claude CLI command for task execution (non-streaming)."""
-    cmd = [
-        "claude", "-p", prompt,
-        "--model", "opus",
-        "--effort", "max",
-        "--permission-mode", "bypassPermissions",
-        "--output-format", "json",
-    ]
-    if session_id:
-        cmd.extend(["--resume", session_id])
-    return cmd
-
-
-def _build_cmd_streaming(
-    prompt: str,
-    session_id: Optional[str] = None,
-) -> list[str]:
-    """Build the claude CLI command with stream-json output for progress tracking."""
-    cmd = [
-        "claude", "-p", prompt,
-        "--model", "opus",
-        "--effort", "max",
-        "--permission-mode", "bypassPermissions",
-        "--output-format", "stream-json",
-        "--verbose",
-    ]
-    if session_id:
-        cmd.extend(["--resume", session_id])
-    return cmd
 
 
 # ── Task dataclass ──
@@ -197,181 +104,52 @@ _background_handles: dict[str, asyncio.Task] = {}
 
 _TASKS_FILE = Path(os.environ.get("SUPERVISOR_TASKS_FILE", "/tmp/supervisor-tasks.json"))
 
+from .task_persistence import (  # noqa: E402
+    _ACTIVE_PROCESS_STATUSES,
+    _SAFE_ID_RE,
+    save_tasks as _save_tasks_impl,
+    save_tasks_unlocked as _save_tasks_unlocked_impl,
+    checkpoint_path as _checkpoint_path_impl,
+    save_checkpoint as _save_checkpoint_impl,
+    load_checkpoint as _load_checkpoint_impl,
+    clear_checkpoint as _clear_checkpoint_impl,
+    load_tasks as _load_tasks_impl,
+)
+
 
 def _save_tasks() -> None:
-    """Persist all tasks to disk.
-
-    NOTE: Caller must NOT hold _tasks_lock when calling this, or use
-    _save_tasks_unlocked() if already holding the lock.
-    """
-    with _tasks_lock:
-        _save_tasks_unlocked()
+    """Persist all tasks to disk."""
+    _save_tasks_impl(_tasks, _tasks_lock, _TASKS_FILE)
 
 
 def _save_tasks_unlocked() -> None:
     """Persist all tasks to disk. Caller MUST hold _tasks_lock."""
-    try:
-        data = {tid: asdict(t) for tid, t in _tasks.items()}
-        tmp = _TASKS_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, default=str))
-        tmp.rename(_TASKS_FILE)
-    except Exception as e:
-        logger.error("Failed to save tasks: %s", e)
-
-
-_SAFE_ID_RE = _re.compile(r'^[0-9a-zA-Z\-]{1,64}$')
+    _save_tasks_unlocked_impl(_tasks, _TASKS_FILE)
 
 
 def _checkpoint_path(task_id: str) -> Path:
-    """Build a safe checkpoint file path, rejecting path-traversal IDs."""
-    if not _SAFE_ID_RE.match(task_id):
-        raise ValueError(f"Invalid task_id for checkpoint: {task_id!r}")
-    return _CHECKPOINT_DIR / f"{task_id}.json"
+    """Build a safe checkpoint file path."""
+    return _checkpoint_path_impl(task_id, _CHECKPOINT_DIR)
 
 
 def _save_checkpoint(task: "Task") -> None:
-    """Save a checkpoint for a running task (crash recovery)."""
-    try:
-        _CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-        data = {
-            "task_id": task.id,
-            "timestamp": time.time(),
-            "steps_completed": list(task.steps_completed),
-            "current_step": task.current_step,
-            "partial_result": task.result or "",
-            "session_id": task.session_id or "",
-        }
-        ckpt_file = _checkpoint_path(task.id)
-        tmp = ckpt_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False))
-        tmp.rename(ckpt_file)
-    except Exception as e:
-        logger.warning("Failed to save checkpoint for %s: %s", task.id[:8], e)
+    """Save a checkpoint for a running task."""
+    _save_checkpoint_impl(task, _CHECKPOINT_DIR)
 
 
 def _load_checkpoint(task_id: str) -> dict | None:
-    """Load checkpoint data for a task. Returns None if not found."""
-    try:
-        ckpt_file = _checkpoint_path(task_id)
-    except ValueError:
-        logger.warning("Skipping checkpoint load for invalid task_id: %s", task_id[:8])
-        return None
-    if not ckpt_file.exists():
-        return None
-    try:
-        return json.loads(ckpt_file.read_text())
-    except Exception as e:
-        logger.warning("Failed to load checkpoint for %s: %s", task_id[:8], e)
-        return None
+    """Load checkpoint data for a task."""
+    return _load_checkpoint_impl(task_id, _CHECKPOINT_DIR)
 
 
 def _clear_checkpoint(task_id: str) -> None:
     """Remove checkpoint file after task completes normally."""
-    try:
-        ckpt_file = _checkpoint_path(task_id)
-        ckpt_file.unlink(missing_ok=True)
-    except ValueError:
-        pass  # invalid ID — no checkpoint to clear
-    except Exception as e:
-        logger.warning("Failed to clear checkpoint for %s: %s", task_id[:8], e)
-
-
-_ACTIVE_PROCESS_STATUSES = frozenset(("running", "follow_up", "learning"))
-"""States that imply an active subprocess was running at crash time.
-These processes are lost on restart and need recovery.
-Other states (pending, waiting_for_input, review, done, awaiting_closure)
-have no live subprocess and are preserved unchanged on restart."""
+    _clear_checkpoint_impl(task_id, _CHECKPOINT_DIR)
 
 
 def _load_tasks() -> None:
-    """Load tasks from disk on startup.
-
-    Recovery strategy for tasks that were active when supervisor crashed:
-    - pending: keep as pending — can be re-dispatched
-    - running/follow_up/learning: mark as interrupted — resumable via /recover
-    - waiting_for_input/review/done/awaiting_closure: preserved (no live process)
-    - completed/cancelled: preserved if <24h old, pruned otherwise
-    Checkpoint data (if available) is merged to preserve progress information.
-    """
-    # Clean up orphaned .tmp file from interrupted save
-    tmp = _TASKS_FILE.with_suffix(".tmp")
-    if tmp.exists() and not _TASKS_FILE.exists():
-        try:
-            tmp.rename(_TASKS_FILE)
-        except OSError:
-            pass
-    elif tmp.exists():
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-
-    if not _TASKS_FILE.exists():
-        return
-    try:
-        data = json.loads(_TASKS_FILE.read_text())
-        interrupted_count = 0
-        for tid, d in data.items():
-            # Skip completed/cancelled tasks older than 24h
-            if d.get("status") in ("completed", "cancelled"):
-                finished = d.get("finished_at") or 0
-                if time.time() - finished > 86400:
-                    continue
-            # Coerce float fields that may be None from JSON
-            filtered = {k: v for k, v in d.items() if k in Task.__dataclass_fields__}
-            for float_field in ("created_at", "started_at", "finished_at"):
-                if float_field in filtered and filtered[float_field] is None:
-                    filtered[float_field] = 0.0
-            task = Task(**filtered)
-
-            # Smart recovery for tasks active during crash
-            if task.status == "pending":
-                # Never started — keep as pending (safe to re-queue)
-                pass
-            elif task.status in _ACTIVE_PROCESS_STATUSES:
-                # Was executing — mark as interrupted, merge checkpoint data
-                old_status = task.status
-                merge_kwargs: dict = {
-                    "status": "interrupted",
-                    "error": f"Supervisor restarted while task was {old_status}",
-                    "finished_at": time.time(),
-                }
-
-                checkpoint = _load_checkpoint(tid)
-                if checkpoint:
-                    # Prefer checkpoint data when it's more complete
-                    ckpt_steps = checkpoint.get("steps_completed", [])
-                    if len(ckpt_steps) > len(task.steps_completed):
-                        merge_kwargs["steps_completed"] = ckpt_steps
-                    ckpt_step = checkpoint.get("current_step", "")
-                    if ckpt_step:
-                        merge_kwargs["current_step"] = ckpt_step
-                    partial = checkpoint.get("partial_result", "")
-                    if partial and not task.result:
-                        merge_kwargs["result"] = partial
-                    ckpt_sid = checkpoint.get("session_id", "")
-                    if ckpt_sid and not task.session_id:
-                        merge_kwargs["session_id"] = ckpt_sid
-
-                task = dc_replace(task, **merge_kwargs)
-                interrupted_count += 1
-                logger.warning(
-                    "Task %s: %s → interrupted (session=%s, steps=%d)",
-                    tid[:8], old_status, bool(task.session_id), len(task.steps_completed),
-                )
-
-            with _tasks_lock:
-                _tasks[tid] = task
-
-        if interrupted_count:
-            logger.info(
-                "Loaded %d tasks (%d interrupted, recoverable via /recover)",
-                len(_tasks), interrupted_count,
-            )
-        else:
-            logger.info("Loaded %d tasks from disk", len(_tasks))
-    except Exception as e:
-        logger.error("Failed to load tasks: %s", e)
+    """Load tasks from disk on startup."""
+    _load_tasks_impl(_tasks, _tasks_lock, _TASKS_FILE, _CHECKPOINT_DIR, Task)
 
 
 # Load on import
@@ -400,192 +178,6 @@ def _set_status(task: Task, new_status: str) -> None:
         _save_tasks_unlocked()
 
 
-# ── Core subprocess runner ──
-
-
-async def _run_claude_streaming(task: Task, env: dict) -> bool:
-    """Try to execute task via streaming. Returns True on success, False if fallback needed."""
-    cmd = _build_cmd_streaming(task.prompt, session_id=task.session_id or None)
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            limit=_STREAM_LIMIT,
-            env=env,
-            cwd=task.cwd or None,
-        )
-    except FileNotFoundError:
-        task.error = "'claude' command not found"
-        return False
-    except Exception as exc:  # noqa: BLE001
-        task.error = str(exc)
-        return False
-
-    accumulated_text = ""
-
-    async def _read_stream():
-        nonlocal accumulated_text
-        async for raw_line in proc.stdout:
-            line = raw_line.decode("utf-8", errors="replace").strip()
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            event_type = data.get("type", "")
-
-            sid = data.get("session_id", "")
-            if sid and not task.session_id:
-                task.session_id = sid
-
-            if event_type == "assistant":
-                msg = data.get("message", {})
-                if not isinstance(msg, dict):
-                    continue
-                for block in msg.get("content", []):
-                    if not isinstance(block, dict):
-                        continue
-                    if block.get("type") == "tool_use":
-                        tool_name = block.get("name", "unknown")
-                        tool_input = str(block.get("input", {}))[:80]
-                        step_desc = f"{tool_name}: {tool_input}"
-                        task.current_step = step_desc
-                        task.steps_completed.append(step_desc)
-                        _save_checkpoint(task)
-                    elif block.get("type") == "text":
-                        text = block.get("text", "")
-                        if text:
-                            accumulated_text = text
-
-            elif event_type == "result":
-                task.result = data.get("result", "") or accumulated_text
-                sid = data.get("session_id", "")
-                if sid:
-                    task.session_id = sid
-                break
-
-    try:
-        await asyncio.wait_for(_read_stream(), timeout=SUPERVISOR_TASK_TIMEOUT)
-    except asyncio.TimeoutError:
-        _save_checkpoint(task)
-        try:
-            proc.kill()
-            await proc.wait()
-        except ProcessLookupError:
-            pass
-        task.error = f"Timed out after {SUPERVISOR_TASK_TIMEOUT}s (streaming)"
-        logger.warning("Task %s: streaming timed out after %ds", task.id[:8], SUPERVISOR_TASK_TIMEOUT)
-        return False
-    except Exception as exc:  # noqa: BLE001
-        task.error = str(exc)
-        return False
-
-    await proc.wait()
-
-    if proc.returncode != 0:
-        stderr_data = await proc.stderr.read()
-        task.error = stderr_data.decode("utf-8", errors="replace").strip() or "unknown error"
-        logger.warning(
-            "Task %s streaming failed (code %d): %s",
-            task.id[:8], proc.returncode, task.error[:300],
-        )
-        return False
-
-    if not task.result:
-        task.result = accumulated_text or ""
-
-    return True
-
-
-async def _run_claude_non_streaming(task: Task, env: dict) -> bool:
-    """Execute task via non-streaming JSON mode. Returns True on success."""
-    cmd = _build_cmd(task.prompt, session_id=task.session_id or None)
-    task.current_step = "Running (non-streaming fallback)..."
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            limit=_STREAM_LIMIT,
-            env=env,
-            cwd=task.cwd or None,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
-    except asyncio.TimeoutError:
-        task.error = "Timed out (10 min limit)"
-        return False
-    except FileNotFoundError:
-        task.error = "'claude' command not found"
-        return False
-    except Exception as exc:  # noqa: BLE001
-        task.error = str(exc)
-        return False
-
-    if proc.returncode != 0:
-        task.error = stderr.decode("utf-8", errors="replace").strip() or "unknown error"
-        logger.error(
-            "Task %s non-streaming failed (code %d): %s",
-            task.id[:8], proc.returncode, task.error[:500],
-        )
-        return False
-
-    try:
-        data = json.loads(stdout.decode("utf-8"))
-        task.result = data.get("result", "") or "(empty response)"
-        sid = data.get("session_id", "")
-        if sid:
-            task.session_id = sid
-    except (json.JSONDecodeError, TypeError):
-        task.result = stdout.decode("utf-8", errors="replace").strip() or "(empty response)"
-
-    return True
-
-
-async def _run_claude(task: Task) -> None:
-    """Execute `claude -p` for a task.
-
-    Strategy: try streaming first (for progress tracking), fall back to
-    non-streaming if streaming crashes (e.g. HTTP chunk size errors).
-    """
-    env = _build_env()
-
-    _set_status(task, "running")
-    task.current_step = "Starting Claude..."
-    task.started_at = time.time()
-
-    # Try streaming first
-    success = await _run_claude_streaming(task, env)
-
-    if not success:
-        # Streaming failed — retry with non-streaming
-        logger.info(
-            "Task %s: streaming failed, retrying non-streaming. error=%s",
-            task.id[:8], (task.error or "")[:200],
-        )
-        task.error = ""  # clear streaming error
-        success = await _run_claude_non_streaming(task, env)
-
-    if not success:
-        task.finished_at = time.time()
-        _set_status(task, "failed")
-        return
-
-    task.finished_at = time.time()
-    task.current_step = "Finished"
-    _clear_checkpoint(task.id)
-
-    # Check if Claude is asking for input
-    if _looks_like_needs_input(task.result):
-        _set_status(task, "waiting_for_input")
-        task.current_step = "Waiting for user input"
-    else:
-        _set_status(task, "awaiting_closure")
-        task.current_step = "Done — awaiting user confirmation to close"
 
 
 # ── Worker wrappers (semaphore-gated) ──
@@ -851,103 +443,6 @@ async def follow_up_async(task_id: str, user_input: str) -> str:
     return task.result
 
 
-async def _follow_up_streaming(task: Task, user_input: str, env: dict) -> Optional[str]:
-    """Try follow-up via streaming. Returns result text or None on failure."""
-    cmd = _build_cmd_streaming(user_input, session_id=task.session_id)
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            limit=_STREAM_LIMIT,
-            env=env,
-            cwd=task.cwd or None,
-        )
-    except Exception as exc:
-        logger.warning("Follow-up streaming spawn failed: %s", exc)
-        return None
-
-    accumulated_text = ""
-
-    async def _read_follow_up():
-        nonlocal accumulated_text
-        async for raw_line in proc.stdout:
-            line = raw_line.decode("utf-8", errors="replace").strip()
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            if data.get("type") == "assistant":
-                msg = data.get("message", {})
-                if isinstance(msg, dict):
-                    for block in msg.get("content", []):
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            text = block.get("text", "")
-                            if text:
-                                accumulated_text = text
-
-            elif data.get("type") == "result":
-                accumulated_text = data.get("result", "") or accumulated_text
-                break
-
-    try:
-        await asyncio.wait_for(_read_follow_up(), timeout=SUPERVISOR_TASK_TIMEOUT)
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-            await proc.wait()
-        except ProcessLookupError:
-            pass
-        logger.warning("Follow-up streaming timed out after %ds", SUPERVISOR_TASK_TIMEOUT)
-        return None
-    except Exception as exc:
-        logger.warning("Follow-up streaming error: %s", exc)
-        return None
-
-    await proc.wait()
-    if proc.returncode != 0:
-        stderr_data = await proc.stderr.read()
-        logger.warning(
-            "Follow-up streaming failed (code %d): %s",
-            proc.returncode, stderr_data.decode("utf-8", errors="replace")[:300],
-        )
-        return None
-
-    return accumulated_text or "(empty response)"
-
-
-async def _follow_up_non_streaming(task: Task, user_input: str, env: dict) -> Optional[str]:
-    """Follow-up via non-streaming JSON mode (fallback)."""
-    cmd = _build_cmd(user_input, session_id=task.session_id)
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            limit=_STREAM_LIMIT,
-            env=env,
-            cwd=task.cwd or None,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
-    except Exception as exc:
-        logger.error("Follow-up non-streaming failed: %s", exc)
-        return f"Error: {exc}"
-
-    if proc.returncode != 0:
-        err = stderr.decode("utf-8", errors="replace").strip()
-        logger.error("Follow-up non-streaming error (code %d): %s", proc.returncode, err[:300])
-        return f"Error: {err}"
-
-    try:
-        data = json.loads(stdout.decode("utf-8"))
-        return data.get("result", "") or "(empty response)"
-    except (json.JSONDecodeError, TypeError):
-        return stdout.decode("utf-8", errors="replace").strip() or "(empty response)"
 
 
 def close_task(task_id: str) -> str:
@@ -1177,85 +672,8 @@ def cancel_task(task_id: str) -> str:
     return f"Task {task_id[:8]} cancelled."
 
 
-# ── Text formatting for Feishu ──
-
-
-def _status_icon(status: str) -> str:
-    """Map task status to a short label."""
-    icons = {
-        "pending": "PENDING",
-        "running": "RUNNING",
-        "waiting_for_input": "WAITING",
-        "done": "DONE",
-        "awaiting_closure": "AWAIT_CLOSE",
-        "follow_up": "FOLLOW_UP",
-        "review": "REVIEW",
-        "learning": "LEARNING",
-        "completed": "COMPLETED",
-        "failed": "FAILED",
-        "interrupted": "INTERRUPTED",
-        "cancelled": "CANCELLED",
-    }
-    return icons.get(status, status.upper())
-
-
-def _elapsed_str(task: Task) -> str:
-    """Human-readable elapsed time."""
-    if not task.started_at:
-        return ""
-    end = task.finished_at or time.time()
-    secs = int(end - task.started_at)
-    if secs < 60:
-        return f"{secs}s"
-    mins = secs // 60
-    remaining = secs % 60
-    return f"{mins}m{remaining}s"
-
-
-def _format_task(task: Task) -> str:
-    """Format a single task with description, progress, and current step."""
-    lines: list[str] = []
-
-    # Header: status + id + type + elapsed
-    elapsed = _elapsed_str(task)
-    elapsed_part = f" | {elapsed}" if elapsed else ""
-    lines.append(
-        f"[{_status_icon(task.status)}] {task.id[:8]} | {task.task_type}{elapsed_part}"
-    )
-
-    # Description
-    desc = task.description or task.prompt[:60]
-    lines.append(f"  Desc: {desc}")
-
-    # Current step (for running tasks)
-    if task.status == "running" and task.current_step:
-        lines.append(f"  Step: {task.current_step}")
-
-    # Progress: how many steps completed
-    if task.steps_completed:
-        step_count = len(task.steps_completed)
-        last_step = task.steps_completed[-1]
-        if len(last_step) > 60:
-            last_step = last_step[:57] + "..."
-        lines.append(f"  Progress: {step_count} steps | last: {last_step}")
-
-    # Interrupted task: show recovery info
-    if task.status == "interrupted":
-        resumable = "resumable" if task.session_id else "retryable"
-        lines.append(f"  Recovery: {resumable} (session={'yes' if task.session_id else 'no'}, steps={len(task.steps_completed)})")
-        if task.error:
-            lines.append(f"  Reason: {task.error[:100]}")
-
-    # Result or error snippet for finished tasks
-    if task.status in ("done", "completed", "failed"):
-        snippet = (task.result or task.error or "")[:100]
-        if len(task.result or task.error or "") > 100:
-            snippet += "..."
-        if snippet:
-            label = "Error" if task.status == "failed" else "Result"
-            lines.append(f"  {label}: {snippet}")
-
-    return "\n".join(lines)
+# Re-export formatting functions for backward compatibility
+from .task_formatting import _status_icon, _elapsed_str, _format_task  # noqa: F401
 
 
 def get_tasks_text() -> str:
