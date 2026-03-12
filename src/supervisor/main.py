@@ -211,6 +211,9 @@ class Supervisor:
         action = result.get("action", "dispatch")
         logger.info("Route result: action=%s result=%s", action, str(result)[:200])
 
+        from . import action_handlers as _ah
+        from .notification import try_post_reply_close
+
         if action == "reply":
             reply_text = result.get("text", "").strip()
             if not reply_text:
@@ -219,34 +222,30 @@ class Supervisor:
             self._record_message("assistant", reply_text)
 
             # P0-3 fix: post-reply close detection.
-            # If Sonnet misclassified a close as reply, detect close intent
-            # in the reply text and auto-close if exactly 1 task is awaiting.
-            self._try_post_reply_close(text, reply_text, chat_id, message_id)
+            try_post_reply_close(self, text, reply_text, chat_id, message_id)
 
         elif action == "close":
-            await self._handle_sonnet_close(result, chat_id, message_id)
+            await _ah.handle_sonnet_close(self, result, chat_id, message_id)
 
         elif action == "close_all":
-            await self._handle_sonnet_close_all(chat_id, message_id)
+            await _ah.handle_sonnet_close_all(self, chat_id, message_id)
 
         elif action == "follow_up":
-            await self._handle_sonnet_follow_up(result, text, chat_id, message_id)
+            await _ah.handle_sonnet_follow_up(self, result, text, chat_id, message_id)
 
-        elif action in ("orchestrate", "dispatch_multi"):  # dispatch_multi: compat (normalised by route_message)
+        elif action in ("orchestrate", "dispatch_multi"):
             subtasks = result.get("subtasks", [])
             description = result.get("description", text[:80])
             if subtasks:
-                await self._handle_orchestrate(
-                    text, subtasks, chat_id, message_id, description,
+                await _ah.handle_orchestrate(
+                    self, text, subtasks, chat_id, message_id, description,
                 )
             else:
-                await self._handle_dispatch(text, chat_id, message_id, result)
+                await _ah.handle_dispatch(self, text, chat_id, message_id, result)
 
         else:
             # action == "dispatch" (or unknown → safe default)
-            await self._handle_dispatch(text, chat_id, message_id, result)
-
-    # ── Action Handlers ──
+            await _ah.handle_dispatch(self, text, chat_id, message_id, result)
 
     # ── Conversation History ──
 
@@ -257,40 +256,9 @@ class Supervisor:
     def _try_post_reply_close(
         self, user_text: str, reply_text: str, chat_id: str, message_id: str,
     ) -> None:
-        """Post-reply close detection: fix for Sonnet misclassifying close as reply.
-
-        If EITHER the user's message OR Sonnet's reply contains close intent,
-        and exactly 1 task is awaiting closure, auto-close it.
-        Skip if ambiguous (0 or 2+ awaiting tasks).
-        """
-        if not self._task_dispatcher:
-            return
-
-        has_close_intent = (
-            _contains_close_intent(reply_text)
-            or _looks_like_close(user_text)
-            or _contains_close_intent(user_text)
-        )
-        if not has_close_intent:
-            return
-
-        awaiting = self._task_dispatcher.get_awaiting_closure()
-        if len(awaiting) != 1:
-            return
-
-        task = awaiting[0]
-        try:
-            self._task_dispatcher.close_task(task.id)
-            logger.info(
-                "Post-reply auto-close: task %s (user=%s, reply=%s)",
-                task.id[:8], user_text[:40], reply_text[:40],
-            )
-            # Notify user so auto-close is not silent
-            self.gateway.reply_message(
-                message_id, f"(任务 [{task.id[:8]}] 已自动关闭)"
-            )
-        except ValueError as e:
-            logger.warning("Post-reply auto-close failed: %s", e)
+        """Post-reply close detection. Delegates to notification.try_post_reply_close."""
+        from .notification import try_post_reply_close
+        try_post_reply_close(self, user_text, reply_text, chat_id, message_id)
 
     def _get_history_text(self) -> str:
         """Format recent conversation history as text for worker context."""
@@ -302,35 +270,6 @@ class Supervisor:
         from .prompt_builders import build_worker_prompt
         return build_worker_prompt(text, description, self._conversation_history)
 
-    async def _handle_dispatch(
-        self, text: str, chat_id: str, message_id: str, result: dict
-    ):
-        """Dispatch a single task to a worker."""
-        description = result.get("description", "") or text[:80]
-        if not self._task_dispatcher:
-            self.gateway.reply_message(message_id, "Task dispatcher not available.")
-            return
-
-        self.gateway.reply_message(
-            message_id,
-            f"📋 任务已调度\n描述: {description}\n状态: 排队中...",
-        )
-
-        enriched_prompt = self._build_worker_prompt(text, description)
-
-        def on_complete(task):
-            self._notify_task_result(task, chat_id)
-
-        task = await self._task_dispatcher.dispatch(
-            prompt=enriched_prompt,
-            cwd="/workspace",
-            task_type="oneshot",
-            chat_id=chat_id,
-            on_complete=on_complete,
-            description=description,
-        )
-        logger.info("Dispatched: %s -> %s", task.id[:8], description)
-
     def _build_orchestrator_prompt(
         self, text: str, description: str, subtasks: list[str],
     ) -> str:
@@ -338,221 +277,35 @@ class Supervisor:
         from .prompt_builders import build_orchestrator_prompt
         return build_orchestrator_prompt(text, description, subtasks, self._conversation_history)
 
-    async def _handle_orchestrate(
-        self, text: str, subtasks: list[str], chat_id: str,
-        message_id: str, description: str,
-    ):
-        """Dispatch a single orchestrator task that coordinates subagents.
-
-        Unlike the old dispatch_multi (N independent tasks), this creates ONE
-        task whose worker uses the Agent tool to launch and coordinate subagents.
-        Benefits: shared context, inter-agent communication, conflict handling.
-        """
-        if not self._task_dispatcher:
-            self.gateway.reply_message(message_id, "Task dispatcher not available.")
-            return
-
-        subtask_list = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(subtasks))
-        self.gateway.reply_message(
-            message_id,
-            f"📋 编排任务已调度\n总述: {description}\n\n子任务:\n{subtask_list}\n\n"
-            f"单一 orchestrator 将协调 {len(subtasks)} 个 subagent 并行执行",
-        )
-
-        enriched_prompt = self._build_orchestrator_prompt(text, description, subtasks)
-
-        def on_complete(task):
-            self._notify_task_result(task, chat_id)
-
-        task = await self._task_dispatcher.dispatch(
-            prompt=enriched_prompt,
-            cwd="/workspace",
-            task_type="oneshot",
-            chat_id=chat_id,
-            on_complete=on_complete,
-            description=f"[orchestrator] {description}",
-        )
-        logger.info(
-            "Orchestrator dispatched: %s -> %s (%d subtasks)",
-            task.id[:8], description, len(subtasks),
-        )
-
-    async def _handle_follow_up(
-        self, task, text: str, chat_id: str, message_id: str
-    ):
-        """Handle follow-up message to an awaiting_closure task."""
-        self.gateway.reply_message(
-            message_id,
-            f"📎 追问转发给 worker [{task.id[:8]}]...",
-        )
-
-        try:
-            result = await self._task_dispatcher.follow_up_async(task.id, text)
-        except Exception as e:
-            self.gateway.send_message(chat_id, f"追问失败: {e}")
-            return
-
-        truncated = result[:3000] + ("..." if len(result) > 3000 else "")
-        sent_msg_id = self.gateway.send_message(
-            chat_id,
-            f"📎 追问回复 [{task.id[:8]}]\n\n{truncated}\n\n"
-            f"继续追问或 /close {task.id[:8]} 关闭任务",
-        )
-        # Track follow-up reply for chain replies
-        if sent_msg_id:
-            self._message_task_map[sent_msg_id] = task.id
-
-    async def _handle_sonnet_follow_up(
-        self, result: dict, text: str, chat_id: str, message_id: str
-    ):
-        """Handle follow_up action decided by sonnet."""
-        task_id_prefix = result.get("task_id", "")
-        if not task_id_prefix or not self._task_dispatcher:
-            # Fallback: treat as dispatch
-            logger.warning("follow_up action but no task_id, falling back to dispatch")
-            await self._handle_dispatch(text, chat_id, message_id, result)
-            return
-
-        # Find the task by prefix
-        matching = [
-            t for t in self._task_dispatcher.list_tasks()
-            if t.id.startswith(task_id_prefix) and t.status == "awaiting_closure"
-        ]
-        if not matching:
-            logger.warning("follow_up task_id %s not found, falling back to dispatch", task_id_prefix)
-            await self._handle_dispatch(text, chat_id, message_id, result)
-            return
-
-        task = matching[0]
-
-        # Trust Sonnet's classification — no hardcoded fallback overrides.
-        # The routing prompt includes clear disambiguation rules for close vs follow_up.
-        follow_up_text = result.get("text", text)
-        await self._handle_follow_up(task, follow_up_text, chat_id, message_id)
-
-    async def _handle_sonnet_close(
-        self, result: dict, _chat_id: str, message_id: str
-    ):
-        """Handle close action decided by sonnet. Supports single task_id or task_ids array."""
-        if not self._task_dispatcher:
-            reply_text = "没有找到可关闭的任务，请用 /close <id> 指定。"
-            self.gateway.reply_message(message_id, reply_text)
-            self._record_message("assistant", reply_text)
-            return
-
-        # Batch close: task_ids array takes priority over single task_id
-        task_id_prefixes = result.get("task_ids", [])
-        if not task_id_prefixes:
-            single_id = result.get("task_id", "")
-            task_id_prefixes = [single_id] if single_id else []
-
-        if not task_id_prefixes:
-            reply_text = "没有找到可关闭的任务，请用 /close <id> 指定。"
-            self.gateway.reply_message(message_id, reply_text)
-            self._record_message("assistant", reply_text)
-            return
-
-        # Resolve prefixes, preserving input order for interleaved output
-        all_tasks = self._task_dispatcher.list_tasks()
-        resolved: list[tuple[str | None, str | None]] = []  # (task_id, error)
-        for prefix in task_id_prefixes:
-            matching = [
-                t for t in all_tasks
-                if t.id.startswith(prefix) and t.status == "awaiting_closure"
-            ]
-            if matching:
-                resolved.append((matching[0].id, None))
-            else:
-                resolved.append((None, f"未找到匹配的待关闭任务 (id={prefix})"))
-
-        valid_ids = [tid for tid, _ in resolved if tid is not None]
-        if not valid_ids:
-            reply_text = "\n".join(err for _, err in resolved if err) + "\n请用 /tasks 查看。"
-            self.gateway.reply_message(message_id, reply_text)
-            self._record_message("assistant", reply_text)
-            return
-
-        close_results = iter(self._task_dispatcher.close_tasks(valid_ids))
-        output: list[str] = []
-        for task_id, error in resolved:
-            if error is not None:
-                output.append(error)
-            else:
-                output.append(next(close_results))
-        reply_text = "\n".join(output)
-        self.gateway.reply_message(message_id, reply_text)
-        self._record_message("assistant", reply_text)
-
-    async def _handle_sonnet_close_all(self, _chat_id: str, message_id: str):
-        """Handle close_all action — close all tasks in awaiting_closure state."""
-        if not self._task_dispatcher:
-            self.gateway.reply_message(message_id, "Task dispatcher not available.")
-            return
-
-        awaiting = self._task_dispatcher.get_awaiting_closure()
-        if not awaiting:
-            reply_text = "没有待关闭的任务。"
-            self.gateway.reply_message(message_id, reply_text)
-            self._record_message("assistant", reply_text)
-            return
-
-        task_ids = [t.id for t in awaiting]
-        results = self._task_dispatcher.close_tasks(task_ids)
-        reply_text = "\n".join(results)
-        self.gateway.reply_message(message_id, reply_text)
-        self._record_message("assistant", reply_text)
-
-    # ── Task Result Notification ──
-
     def _notify_task_result(self, task, chat_id: str):
-        """Push task result/status to Feishu when a task finishes."""
-        tid = task.id[:8]
-        elapsed = ""
-        if task.started_at:
-            end = task.finished_at or time.time()
-            secs = int(end - task.started_at)
-            if secs < 60:
-                elapsed = f" ({secs}s)"
-            else:
-                elapsed = f" ({secs // 60}m{secs % 60}s)"
+        """Push task result/status to Feishu. Delegates to notification module."""
+        from .notification import notify_task_result
+        notify_task_result(self, task, chat_id)
 
-        if task.status == "awaiting_closure":
-            result_text = task.result or "(empty)"
-            if len(result_text) > 3000:
-                result_text = result_text[:3000] + "\n...(truncated)"
-            msg = (
-                f"✅ 任务完成 [{tid}]{elapsed}\n\n"
-                f"{result_text}\n\n"
-                f"可以直接追问，或 /close {tid} 关闭任务"
-            )
-        elif task.status == "waiting_for_input":
-            msg = (
-                f"⏸️ 任务需要你的输入 [{tid}]{elapsed}\n\n"
-                f"{task.result or '(waiting for input)'}\n\n"
-                f"/reply {tid} <your input>"
-            )
-        elif task.status == "failed":
-            error_text = task.error or task.result or "unknown error"
-            if len(error_text) > 1000:
-                error_text = error_text[:1000] + "..."
-            msg = f"❌ 任务失败 [{tid}]{elapsed}\n\n{error_text}"
-        else:
-            msg = f"ℹ️ 任务状态变更 [{tid}]: {task.status}{elapsed}"
+    # Thin delegation wrappers for backward compatibility with tests
+    async def _handle_dispatch(self, text, chat_id, message_id, result):
+        from . import action_handlers as _ah
+        await _ah.handle_dispatch(self, text, chat_id, message_id, result)
 
-        self._record_message("assistant", msg[:500])
+    async def _handle_orchestrate(self, text, subtasks, chat_id, message_id, description):
+        from . import action_handlers as _ah
+        await _ah.handle_orchestrate(self, text, subtasks, chat_id, message_id, description)
 
-        try:
-            sent_msg_id = self.gateway.push_message(msg, chat_id=chat_id)
-            # Track message→task mapping for reply-based follow-up
-            if sent_msg_id and task.status == "awaiting_closure":
-                self._message_task_map[sent_msg_id] = task.id
-                # Cap the map to prevent unbounded growth
-                if len(self._message_task_map) > 500:
-                    oldest_keys = list(self._message_task_map.keys())[:-500]
-                    for k in oldest_keys:
-                        del self._message_task_map[k]
-        except Exception as e:
-            logger.error("Failed to notify task result: %s", e)
+    async def _handle_follow_up(self, task, text, chat_id, message_id):
+        from . import action_handlers as _ah
+        await _ah.handle_follow_up(self, task, text, chat_id, message_id)
+
+    async def _handle_sonnet_follow_up(self, result, text, chat_id, message_id):
+        from . import action_handlers as _ah
+        await _ah.handle_sonnet_follow_up(self, result, text, chat_id, message_id)
+
+    async def _handle_sonnet_close(self, result, _chat_id, message_id):
+        from . import action_handlers as _ah
+        await _ah.handle_sonnet_close(self, result, _chat_id, message_id)
+
+    async def _handle_sonnet_close_all(self, _chat_id, message_id):
+        from . import action_handlers as _ah
+        await _ah.handle_sonnet_close_all(self, _chat_id, message_id)
 
     # ══════════════════════════════════════════════════════════
     # Incoming Message Router (entry point from Feishu)

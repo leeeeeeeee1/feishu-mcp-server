@@ -66,16 +66,20 @@ def _write_tasks_json(tasks_file: Path, tasks: dict[str, Task]) -> None:
 
 def _swap_tasks_file(tmp_path: Path):
     """Context manager-like setup: swap _TASKS_FILE to tmp_path, clear _tasks."""
+    from supervisor import task_state as _ts
     tasks_file = tmp_path / "tasks.json"
     original = td._TASKS_FILE
     td._TASKS_FILE = tasks_file
+    _ts._TASKS_FILE = tasks_file  # Also update canonical source
     _tasks.clear()
     return tasks_file, original
 
 
 def _restore_tasks_file(original: Path):
     """Restore original _TASKS_FILE and clear _tasks."""
+    from supervisor import task_state as _ts
     td._TASKS_FILE = original
+    _ts._TASKS_FILE = original  # Also restore canonical source
     _tasks.clear()
 
 
@@ -689,11 +693,14 @@ class TestCheckpointMerge:
         (ckpt_dir / "t1.json").write_text(json.dumps(ckpt_data))
 
         original_ckpt = td._CHECKPOINT_DIR
+        from supervisor import task_state as _tsc
         td._CHECKPOINT_DIR = ckpt_dir
+        _tsc._CHECKPOINT_DIR = ckpt_dir
         try:
             _load_tasks()
         finally:
             td._CHECKPOINT_DIR = original_ckpt
+            _tsc._CHECKPOINT_DIR = original_ckpt
 
         t = _tasks["t1"]
         assert t.status == "interrupted"
@@ -727,11 +734,14 @@ class TestCheckpointMerge:
         (ckpt_dir / "t1.json").write_text(json.dumps(ckpt_data))
 
         original_ckpt = td._CHECKPOINT_DIR
+        from supervisor import task_state as _tsc
         td._CHECKPOINT_DIR = ckpt_dir
+        _tsc._CHECKPOINT_DIR = ckpt_dir
         try:
             _load_tasks()
         finally:
             td._CHECKPOINT_DIR = original_ckpt
+            _tsc._CHECKPOINT_DIR = original_ckpt
 
         assert _tasks["t1"].session_id == existing_sid
 
@@ -745,11 +755,14 @@ class TestCheckpointMerge:
         })
 
         original_ckpt = td._CHECKPOINT_DIR
+        from supervisor import task_state as _tsc
         td._CHECKPOINT_DIR = ckpt_dir
+        _tsc._CHECKPOINT_DIR = ckpt_dir
         try:
             _load_tasks()
         finally:
             td._CHECKPOINT_DIR = original_ckpt
+            _tsc._CHECKPOINT_DIR = original_ckpt
 
         assert _tasks["t1"].status == "interrupted"
         assert "restarted" in _tasks["t1"].error.lower()
@@ -777,11 +790,14 @@ class TestCheckpointMerge:
         (ckpt_dir / "t1.json").write_text(json.dumps(ckpt_data))
 
         original_ckpt = td._CHECKPOINT_DIR
+        from supervisor import task_state as _tsc
         td._CHECKPOINT_DIR = ckpt_dir
+        _tsc._CHECKPOINT_DIR = ckpt_dir
         try:
             _load_tasks()
         finally:
             td._CHECKPOINT_DIR = original_ckpt
+            _tsc._CHECKPOINT_DIR = original_ckpt
 
         assert _tasks["t1"].steps_completed == ["s1", "s2", "s3"]
 

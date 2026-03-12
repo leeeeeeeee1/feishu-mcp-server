@@ -8,28 +8,31 @@ daemon restart, and an experience-review loop.
 import asyncio
 import json
 import logging
-import os
-import threading
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
-# ── Configuration from environment ──
-
-SUPERVISOR_MAX_WORKERS = int(os.environ.get("SUPERVISOR_MAX_WORKERS", "3"))
-SUPERVISOR_MAX_DAEMONS = int(os.environ.get("SUPERVISOR_MAX_DAEMONS", "2"))
-SUPERVISOR_TASK_TIMEOUT = int(os.environ.get("SUPERVISOR_TASK_TIMEOUT", "1800"))
-
-# Checkpoint directory for crash recovery
-_CHECKPOINT_DIR = Path(os.environ.get("SUPERVISOR_CHECKPOINT_DIR", "/tmp/supervisor-checkpoints"))
-
-# asyncio StreamReader default limit is 64KB — too small for claude stream-json
-# which can emit single lines >64KB (e.g. large code blocks). 10MB is safe.
-_STREAM_LIMIT = 10 * 1024 * 1024  # 10 MB
+# Re-export state from task_state for backward compatibility
+from .task_state import (  # noqa: F401
+    SUPERVISOR_MAX_WORKERS,
+    SUPERVISOR_MAX_DAEMONS,
+    SUPERVISOR_TASK_TIMEOUT,
+    _CHECKPOINT_DIR,
+    _STREAM_LIMIT,
+    _TASKS_FILE,
+    Task,
+    _generate_description,
+    _tasks,
+    _tasks_lock,
+    _background_handles,
+    _get_worker_semaphore,
+    _get_daemon_semaphore,
+    _set_status,
+    _reset,
+)
 
 # Re-export pattern matching functions for backward compatibility
 from .patterns import (  # noqa: F401
@@ -43,7 +46,6 @@ from .patterns import (  # noqa: F401
     _looks_like_close,
 )
 
-
 # Re-export subprocess functions for backward compatibility
 from .subprocess_runner import (  # noqa: F401
     _build_env,
@@ -56,51 +58,19 @@ from .subprocess_runner import (  # noqa: F401
     _follow_up_non_streaming,
 )
 
-
-# ── Task dataclass ──
-
-
-@dataclass
-class Task:
-    """Represents a dispatched task."""
-    id: str
-    prompt: str
-    task_type: str  # "oneshot" or "daemon"
-    status: str  # pending, running, waiting_for_input, done, awaiting_closure, follow_up, review, learning, completed, failed, interrupted, cancelled
-    description: str = ""  # short human-readable summary (auto-generated from prompt)
-    current_step: str = ""  # what the task is doing right now
-    steps_completed: list = field(default_factory=list)  # list of completed step descriptions
-    session_id: str = ""
-    cwd: str = ""
-    result: str = ""
-    error: str = ""
-    created_at: float = 0.0
-    started_at: float = 0.0
-    finished_at: float = 0.0
-    retries: int = 0
-    max_retries: int = 3
-
-
-def _generate_description(prompt: str) -> str:
-    """Generate a short description from the task prompt."""
-    # Take the first line, truncated
-    first_line = prompt.strip().split("\n")[0]
-    if len(first_line) > 80:
-        return first_line[:77] + "..."
-    return first_line
-
-
-# ── Dispatcher singleton state ──
-
-_tasks: dict[str, Task] = {}
-_tasks_lock = threading.Lock()  # Protects all reads/writes to _tasks
-_worker_semaphore: asyncio.Semaphore | None = None
-_daemon_semaphore: asyncio.Semaphore | None = None
-_background_handles: dict[str, asyncio.Task] = {}
+# Re-export query functions for backward compatibility
+from .task_queries import (  # noqa: F401
+    get_task,
+    list_tasks,
+    list_daemons,
+    get_review_pending,
+    list_interrupted,
+    get_awaiting_closure,
+    get_tasks_text,
+    get_daemons_text,
+)
 
 # ── Task persistence ──
-
-_TASKS_FILE = Path(os.environ.get("SUPERVISOR_TASKS_FILE", "/tmp/supervisor-tasks.json"))
 
 from .task_persistence import (  # noqa: E402, F401
     _ACTIVE_PROCESS_STATUSES,
@@ -115,64 +85,49 @@ from .task_persistence import (  # noqa: E402, F401
 
 
 def _save_tasks() -> None:
-    """Persist all tasks to disk."""
-    _save_tasks_impl(_tasks, _tasks_lock, _TASKS_FILE)
+    """Persist all tasks to disk. Reads _TASKS_FILE from task_state to avoid stale bindings."""
+    from . import task_state as _ts
+    _save_tasks_impl(_ts._tasks, _ts._tasks_lock, _ts._TASKS_FILE)
 
 
 def _save_tasks_unlocked() -> None:
     """Persist all tasks to disk. Caller MUST hold _tasks_lock."""
-    _save_tasks_unlocked_impl(_tasks, _TASKS_FILE)
+    from . import task_state as _ts
+    _save_tasks_unlocked_impl(_ts._tasks, _ts._TASKS_FILE)
 
 
 def _checkpoint_path(task_id: str) -> Path:
     """Build a safe checkpoint file path."""
-    return _checkpoint_path_impl(task_id, _CHECKPOINT_DIR)
+    from . import task_state as _ts
+    return _checkpoint_path_impl(task_id, _ts._CHECKPOINT_DIR)
 
 
 def _save_checkpoint(task: "Task") -> None:
     """Save a checkpoint for a running task."""
-    _save_checkpoint_impl(task, _CHECKPOINT_DIR)
+    from . import task_state as _ts
+    _save_checkpoint_impl(task, _ts._CHECKPOINT_DIR)
 
 
 def _load_checkpoint(task_id: str) -> dict | None:
     """Load checkpoint data for a task."""
-    return _load_checkpoint_impl(task_id, _CHECKPOINT_DIR)
+    from . import task_state as _ts
+    return _load_checkpoint_impl(task_id, _ts._CHECKPOINT_DIR)
 
 
 def _clear_checkpoint(task_id: str) -> None:
     """Remove checkpoint file after task completes normally."""
-    _clear_checkpoint_impl(task_id, _CHECKPOINT_DIR)
+    from . import task_state as _ts
+    _clear_checkpoint_impl(task_id, _ts._CHECKPOINT_DIR)
 
 
 def _load_tasks() -> None:
     """Load tasks from disk on startup."""
-    _load_tasks_impl(_tasks, _tasks_lock, _TASKS_FILE, _CHECKPOINT_DIR, Task)
+    from . import task_state as _ts
+    _load_tasks_impl(_ts._tasks, _ts._tasks_lock, _ts._TASKS_FILE, _ts._CHECKPOINT_DIR, Task)
 
 
 # Load on import
 _load_tasks()
-
-
-def _get_worker_semaphore() -> asyncio.Semaphore:
-    global _worker_semaphore
-    if _worker_semaphore is None:
-        _worker_semaphore = asyncio.Semaphore(SUPERVISOR_MAX_WORKERS)
-    return _worker_semaphore
-
-
-def _get_daemon_semaphore() -> asyncio.Semaphore:
-    global _daemon_semaphore
-    if _daemon_semaphore is None:
-        _daemon_semaphore = asyncio.Semaphore(SUPERVISOR_MAX_DAEMONS)
-    return _daemon_semaphore
-
-
-def _set_status(task: Task, new_status: str) -> None:
-    with _tasks_lock:
-        old = task.status
-        task.status = new_status
-        logger.info("Task %s: %s -> %s", task.id[:8], old, new_status)
-        _save_tasks_unlocked()
 
 
 
@@ -478,12 +433,6 @@ def close_tasks(task_ids: list[str]) -> list[str]:
     return results
 
 
-def get_awaiting_closure() -> list[Task]:
-    """Return tasks in awaiting_closure status."""
-    with _tasks_lock:
-        return [t for t in _tasks.values() if t.status == "awaiting_closure"]
-
-
 def skip_review(task_id: str) -> str:
     """Skip the review step for a task, moving straight to completed.
 
@@ -499,42 +448,6 @@ def skip_review(task_id: str) -> str:
 
     _set_status(task, "completed")
     return f"Task {task_id[:8]} marked as completed (review skipped)."
-
-
-# ── Query helpers ──
-
-
-def get_task(task_id: str) -> Task:
-    """Get a single task by ID."""
-    with _tasks_lock:
-        task = _tasks.get(task_id)
-    if task is None:
-        raise ValueError(f"Unknown task: {task_id}")
-    return task
-
-
-def list_tasks() -> list[Task]:
-    """Return a snapshot of all tasks (safe to iterate without lock)."""
-    with _tasks_lock:
-        return list(_tasks.values())
-
-
-def list_daemons() -> list[Task]:
-    """Return only daemon tasks."""
-    with _tasks_lock:
-        return [t for t in _tasks.values() if t.task_type == "daemon"]
-
-
-def get_review_pending() -> list[Task]:
-    """Return tasks in review or waiting_for_input status."""
-    with _tasks_lock:
-        return [t for t in _tasks.values() if t.status in ("review", "waiting_for_input")]
-
-
-def list_interrupted() -> list[Task]:
-    """Return tasks in interrupted status (recoverable after restart)."""
-    with _tasks_lock:
-        return [t for t in _tasks.values() if t.status == "interrupted"]
 
 
 async def recover_task(
@@ -671,54 +584,3 @@ def cancel_task(task_id: str) -> str:
 
 # Re-export formatting functions for backward compatibility
 from .task_formatting import _status_icon, _elapsed_str, _format_task  # noqa: F401
-
-
-def get_tasks_text() -> str:
-    """Formatted summary of all tasks for Feishu."""
-    with _tasks_lock:
-        if not _tasks:
-            return "No tasks."
-        snapshot = list(_tasks.values())
-
-    running = [t for t in snapshot if t.status == "running"]
-    pending = [t for t in snapshot if t.status == "pending"]
-    finished = [t for t in snapshot if t.status not in ("running", "pending")]
-
-    sections: list[str] = []
-    sections.append(f"Tasks: {len(running)} running, {len(pending)} pending, {len(finished)} finished")
-    sections.append("-" * 40)
-
-    for task in running + pending + finished:
-        sections.append(_format_task(task))
-
-    return "\n".join(sections)
-
-
-def get_daemons_text() -> str:
-    """Formatted summary of daemon tasks for Feishu."""
-    daemons = list_daemons()
-    if not daemons:
-        return "No daemon tasks."
-    lines = [_format_task(t) for t in daemons]
-    return "\n".join(lines)
-
-
-# ── Cleanup (for testing) ──
-
-
-def _reset() -> None:
-    """Reset all internal state. Used by tests only."""
-    global _worker_semaphore, _daemon_semaphore, _TASKS_FILE, _CHECKPOINT_DIR
-    with _tasks_lock:
-        _tasks.clear()
-    for h in _background_handles.values():
-        if not h.done():
-            h.cancel()
-    _background_handles.clear()
-    _worker_semaphore = None
-    _daemon_semaphore = None
-    # Redirect persistence to temp paths to avoid polluting production data
-    _TASKS_FILE = Path("/tmp/supervisor-tasks-test.json")
-    _TASKS_FILE.unlink(missing_ok=True)
-    _CHECKPOINT_DIR = Path("/tmp/supervisor-checkpoints-test")
-    _CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)

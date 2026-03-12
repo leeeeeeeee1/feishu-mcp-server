@@ -9,7 +9,7 @@ import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .task_dispatcher import Task
+    from .task_state import Task
 
 
 def _status_icon(status: str) -> str:
