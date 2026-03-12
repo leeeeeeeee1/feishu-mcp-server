@@ -74,12 +74,15 @@ def _clean_state():
 @pytest.fixture
 def tasks_file(tmp_path):
     """Provide a temp tasks file and restore original after test."""
+    from supervisor import task_state as _ts
     f = tmp_path / "tasks.json"
     original = td._TASKS_FILE
     td._TASKS_FILE = f
+    _ts._TASKS_FILE = f  # Also update canonical source
     _tasks.clear()
     yield f
     td._TASKS_FILE = original
+    _ts._TASKS_FILE = original  # Also restore canonical source
     _tasks.clear()
 
 
@@ -396,11 +399,14 @@ class TestCheckpointMergeActiveStates:
         (ckpt_dir / "t1.json").write_text(json.dumps(ckpt_data))
 
         original_ckpt = td._CHECKPOINT_DIR
+        from supervisor import task_state as _tsc
         td._CHECKPOINT_DIR = ckpt_dir
+        _tsc._CHECKPOINT_DIR = ckpt_dir
         try:
             _load_tasks()
         finally:
             td._CHECKPOINT_DIR = original_ckpt
+            _tsc._CHECKPOINT_DIR = original_ckpt
 
         t = _tasks["t1"]
         assert t.status == "interrupted"
@@ -431,11 +437,14 @@ class TestCheckpointMergeActiveStates:
         (ckpt_dir / "t1.json").write_text(json.dumps(ckpt_data))
 
         original_ckpt = td._CHECKPOINT_DIR
+        from supervisor import task_state as _tsc
         td._CHECKPOINT_DIR = ckpt_dir
+        _tsc._CHECKPOINT_DIR = ckpt_dir
         try:
             _load_tasks()
         finally:
             td._CHECKPOINT_DIR = original_ckpt
+            _tsc._CHECKPOINT_DIR = original_ckpt
 
         t = _tasks["t1"]
         assert t.status == "interrupted"
@@ -491,12 +500,15 @@ class TestRecoverTaskEdgeCases:
         _tasks["t1"] = task
 
         original_ckpt = td._CHECKPOINT_DIR
+        from supervisor import task_state as _tsc
         td._CHECKPOINT_DIR = ckpt_dir
+        _tsc._CHECKPOINT_DIR = ckpt_dir
         try:
             asyncio.run(
                 recover_task("t1", mode="dismiss")
             )
         finally:
             td._CHECKPOINT_DIR = original_ckpt
+            _tsc._CHECKPOINT_DIR = original_ckpt
 
         assert not ckpt_file.exists()

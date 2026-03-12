@@ -453,9 +453,9 @@ class TestSemaphore:
 
         async def _test():
             with patch("supervisor.task_dispatcher.SUPERVISOR_MAX_WORKERS", 2):
-                # Reset semaphore so it picks up the patched value
-                import supervisor.task_dispatcher as td
-                td._worker_semaphore = asyncio.Semaphore(2)
+                # Reset semaphore on canonical source (task_state) so _get_worker_semaphore uses it
+                import supervisor.task_state as _ts
+                _ts._worker_semaphore = asyncio.Semaphore(2)
 
                 with patch("supervisor.task_dispatcher.asyncio.create_subprocess_exec",
                            side_effect=slow_exec):
@@ -813,7 +813,9 @@ class TestLoadTasksPersistence:
 
         # Temporarily swap the file path
         original = td._TASKS_FILE
+        import supervisor.task_state as _ts
         td._TASKS_FILE = tasks_file
+        _ts._TASKS_FILE = tasks_file
         _tasks.clear()
         try:
             _load_tasks()
@@ -823,6 +825,7 @@ class TestLoadTasksPersistence:
             assert t.finished_at == 0.0
         finally:
             td._TASKS_FILE = original
+            _ts._TASKS_FILE = original
             _tasks.clear()
 
     def test_load_tasks_orphaned_tmp_recovery(self, tmp_path):
@@ -846,7 +849,9 @@ class TestLoadTasksPersistence:
         tmp_file.write_text(json.dumps(data))
 
         original = td._TASKS_FILE
+        import supervisor.task_state as _ts
         td._TASKS_FILE = tasks_file
+        _ts._TASKS_FILE = tasks_file
         _tasks.clear()
         try:
             _load_tasks()
@@ -855,6 +860,7 @@ class TestLoadTasksPersistence:
             assert "task-456" in _tasks
         finally:
             td._TASKS_FILE = original
+            _ts._TASKS_FILE = original
             _tasks.clear()
 
     def test_load_tasks_running_marked_interrupted(self, tmp_path):
@@ -879,7 +885,9 @@ class TestLoadTasksPersistence:
         tasks_file.write_text(json.dumps(data))
 
         original = td._TASKS_FILE
+        import supervisor.task_state as _ts
         td._TASKS_FILE = tasks_file
+        _ts._TASKS_FILE = tasks_file
         _tasks.clear()
         try:
             _load_tasks()
@@ -887,6 +895,7 @@ class TestLoadTasksPersistence:
             assert "restarted" in _tasks["task-789"].error.lower()
         finally:
             td._TASKS_FILE = original
+            _ts._TASKS_FILE = original
             _tasks.clear()
 
     def test_load_tasks_pending_stays_pending(self, tmp_path):
@@ -909,7 +918,9 @@ class TestLoadTasksPersistence:
         tasks_file.write_text(json.dumps(data))
 
         original = td._TASKS_FILE
+        import supervisor.task_state as _ts
         td._TASKS_FILE = tasks_file
+        _ts._TASKS_FILE = tasks_file
         _tasks.clear()
         try:
             _load_tasks()
@@ -917,6 +928,7 @@ class TestLoadTasksPersistence:
             assert _tasks["task-aaa"].error == ""
         finally:
             td._TASKS_FILE = original
+            _ts._TASKS_FILE = original
             _tasks.clear()
 
     def test_load_tasks_running_with_checkpoint_result(self, tmp_path):
@@ -954,10 +966,13 @@ class TestLoadTasksPersistence:
         }
         tasks_file.write_text(json.dumps(data))
 
+        import supervisor.task_state as _ts
         original_tasks = td._TASKS_FILE
         original_ckpt = td._CHECKPOINT_DIR
         td._TASKS_FILE = tasks_file
+        _ts._TASKS_FILE = tasks_file
         td._CHECKPOINT_DIR = checkpoint_dir
+        _ts._CHECKPOINT_DIR = checkpoint_dir
         _tasks.clear()
         try:
             _load_tasks()
@@ -968,7 +983,9 @@ class TestLoadTasksPersistence:
             assert t.result == "All 5 tests passed."
         finally:
             td._TASKS_FILE = original_tasks
+            _ts._TASKS_FILE = original_tasks
             td._CHECKPOINT_DIR = original_ckpt
+            _ts._CHECKPOINT_DIR = original_ckpt
             _tasks.clear()
 
 
